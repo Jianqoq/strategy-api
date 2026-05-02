@@ -77,7 +77,7 @@ pub trait Strategy {
 /// # Example
 ///
 /// ```rust,ignore
-/// use strategy_api::{Bar, DrawCtx, Signal, Strategy, BUY, SELL, HOLD, export_strategy};
+/// use strategy_api::{Bar, BacktestCtx, OrderKind, Side, Strategy, export_strategy};
 ///
 /// struct MyStrategy {
 ///     prev_close: f32,
@@ -93,16 +93,18 @@ pub trait Strategy {
 ///         self.prev_close = 0.0;
 ///     }
 ///
-///     fn on_bar(&mut self, bar: &Bar, index: usize, ctx: &mut DrawCtx) -> Signal {
-///         ctx.circle(index as f64 + 0.5, bar.close as f64, 3.0, [255, 200, 0, 200]);
-///         let signal = if bar.close > self.prev_close { BUY }
-///                      else if bar.close < self.prev_close { SELL }
-///                      else { HOLD };
+///     fn on_bar(&mut self, bar: &Bar, _index: usize, ctx: &mut BacktestCtx) {
+///         if bar.close > self.prev_close {
+///             ctx.submit_order(Side::Long, OrderKind::Market, 1.0);
+///             ctx.mark_buy(bar.close);
+///         } else if bar.close < self.prev_close {
+///             ctx.submit_order(Side::Short, OrderKind::Market, 1.0);
+///             ctx.mark_sell(bar.close);
+///         }
 ///         self.prev_close = bar.close;
-///         signal
 ///     }
 ///
-///     fn on_finish(&mut self, _ctx: &mut DrawCtx) {}
+///     fn on_finish(&mut self, _ctx: &mut BacktestCtx) {}
 /// }
 ///
 /// export_strategy!(MyStrategy);
@@ -149,7 +151,7 @@ macro_rules! export_strategy {
         pub extern "C" fn on_bar(
             bar: *const $crate::Bar,
             index: usize,
-            ctx: *mut $crate::DrawCtx,
+            ctx: *mut $crate::BacktestCtx,
         ) {
             let bar = unsafe { &*bar };
             let ctx = unsafe { &mut *ctx };
@@ -157,7 +159,7 @@ macro_rules! export_strategy {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn on_finish(ctx: *mut $crate::DrawCtx) {
+        pub extern "C" fn on_finish(ctx: *mut $crate::BacktestCtx) {
             let ctx = unsafe { &mut *ctx };
             <$ty as $crate::Strategy>::on_finish(&mut *get_instance(), ctx);
         }
