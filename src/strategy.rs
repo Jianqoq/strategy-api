@@ -1,4 +1,4 @@
-use crate::{Bar, DrawCtx};
+use crate::{Bar, BacktestCtx};
 
 // ── Signal ────────────────────────────────────────────────────────────────────
 
@@ -24,8 +24,8 @@ pub struct StrategyInfo {
 
 pub type FnStrategyInfo = unsafe extern "C" fn() -> StrategyInfo;
 pub type FnOnInit = unsafe extern "C" fn(total_bars: usize);
-pub type FnOnBar = unsafe extern "C" fn(bar: *const Bar, index: usize, ctx: *mut DrawCtx) -> Signal;
-pub type FnOnFinish = unsafe extern "C" fn(ctx: *mut DrawCtx);
+pub type FnOnBar = unsafe extern "C" fn(bar: *const Bar, index: usize, ctx: *mut BacktestCtx);
+pub type FnOnFinish = unsafe extern "C" fn(ctx: *mut BacktestCtx);
 
 // ── Strategy trait ────────────────────────────────────────────────────────────
 
@@ -64,10 +64,10 @@ pub trait Strategy {
     /// - `ctx`   — drawing context; call `ctx.line()`, `ctx.circle()`, etc.
     ///
     /// Return `BUY`, `SELL`, or `HOLD`.
-    fn on_bar(&mut self, bar: &Bar, index: usize, ctx: &mut DrawCtx) -> Signal;
+    fn on_bar(&mut self, bar: &Bar, index: usize, ctx: &mut BacktestCtx);
 
     /// Called once after the last bar. Use this to draw final annotations.
-    fn on_finish(&mut self, ctx: &mut DrawCtx);
+    fn on_finish(&mut self, ctx: &mut BacktestCtx);
 }
 
 // ── Export macro ──────────────────────────────────────────────────────────────
@@ -150,7 +150,7 @@ macro_rules! export_strategy {
             bar: *const $crate::Bar,
             index: usize,
             ctx: *mut $crate::DrawCtx,
-        ) -> $crate::Signal {
+        ) {
             let bar = unsafe { &*bar };
             let ctx = unsafe { &mut *ctx };
             <$ty as $crate::Strategy>::on_bar(&mut *get_instance(), bar, index, ctx)
