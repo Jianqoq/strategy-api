@@ -1,13 +1,421 @@
-pub struct BacktestCtx {}
+use rustc_hash::FxHashMap;
+
+// ── Identifiers ───────────────────────────────────────────────────────────────
+
+pub type OrderId = u64;
+pub type PositionId = u64;
+
+// ── Side ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Long,
+    Short,
+}
+
+// ── Order ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OrderKind {
+    Market,
+    Limit { limit_price: f32 },
+    Stop { stop_price: f32 },
+    StopLimit { stop_price: f32, limit_price: f32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderStatus {
+    Pending,
+    PartiallyFilled,
+    Filled,
+    Cancelled,
+    Rejected,
+}
+
+#[derive(Debug, Clone)]
+pub struct Fill {
+    pub bar_index: usize,
+    pub price: f32,
+    pub qty: f64,
+    pub commission: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Order {
+    pub id: OrderId,
+    pub submitted_bar: usize,
+    pub side: Side,
+    pub kind: OrderKind,
+    /// Total requested quantity.
+    pub qty: f64,
+    /// Quantity successfully filled so far.
+    pub filled_qty: f64,
+    /// Volume-weighted average fill price across all fills.
+    pub avg_fill_price: f64,
+    pub status: OrderStatus,
+    pub fills: Vec<Fill>,
+}
+
+impl Order {
+    pub fn remaining_qty(&self) -> f64 {
+        self.qty - self.filled_qty
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected
+        )
+    }
+}
+
+// ── Position ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Position {
+    pub id: PositionId,
+    pub side: Side,
+    pub open_bar: usize,
+    /// Current remaining quantity (decreases on partial close).
+    pub qty: f64,
+    /// Volume-weighted average entry cost across all entry fills.
+    pub avg_cost: f64,
+    /// All fills that opened or added to this position.
+    pub entry_fills: Vec<Fill>,
+    /// All fills that partially or fully closed this position.
+    pub exit_fills: Vec<Fill>,
+}
+
+impl Position {
+    pub fn unrealized_pnl(&self, current_price: f32) -> f64 {
+        let price = current_price as f64;
+        match self.side {
+            Side::Long => (price - self.avg_cost) * self.qty,
+            Side::Short => (self.avg_cost - price) * self.qty,
+        }
+    }
+}
+
+// ── Trade (closed position record) ────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Trade {
+    pub position_id: PositionId,
+    pub side: Side,
+    pub open_bar: usize,
+    pub close_bar: usize,
+    /// Quantity closed in this trade record (may be partial).
+    pub qty: f64,
+    pub avg_entry: f64,
+    pub avg_exit: f64,
+    pub gross_pnl: f64,
+    pub commission: f64,
+    pub net_pnl: f64,
+}
+
+// ── Annotation ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationKind {
+    ArrowUp,
+    ArrowDown,
+    HLine,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Annotation {
+    pub bar_index: usize,
+    pub price: f32,
+    /// ARGB packed: 0xAARRGGBB
+    pub color: u32,
+    pub kind: AnnotationKind,
+}
+
+// ── BacktestCtx ───────────────────────────────────────────────────────────────
+
+pub struct BacktestCtx {
+    // Account
+    pub initial_capital: f64,
+    pub cash: f64,
+    pub commission_rate: f64,
+    pub slippage: f32,
+
+    // Live orders: Pending or PartiallyFilled, keyed by order id
+    pub open_orders: FxHashMap<OrderId, Order>,
+    // Terminal orders: Filled, Cancelled, or Rejected
+    pub closed_orders: Vec<Order>,
+
+    // Open positions (Long and Short can coexist)
+    pub open_positions: Vec<Position>,
+    // Completed trade records (fully or partially closed positions)
+    pub closed_trades: Vec<Trade>,
+
+    // Equity tracking
+    pub equity_curve: Vec<f64>,
+    pub peak_equity: f64,
+    pub max_drawdown: f64,
+
+    // Chart annotations
+    pub annotations: Vec<Annotation>,
+
+    // Progress (set by host before each on_bar call)
+    pub current_bar_index: usize,
+    pub total_bars: usize,
+
+    next_order_id: OrderId,
+    next_position_id: PositionId,
+}
 
 impl BacktestCtx {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(
+        initial_capital: f64,
+        commission_rate: f64,
+        slippage: f32,
+        total_bars: usize,
+    ) -> Self {
+        Self {
+            initial_capital,
+            cash: initial_capital,
+            commission_rate,
+            slippage,
+            open_orders: FxHashMap::default(),
+            closed_orders: Vec::new(),
+            open_positions: Vec::new(),
+            closed_trades: Vec::new(),
+            equity_curve: Vec::with_capacity(total_bars),
+            peak_equity: initial_capital,
+            max_drawdown: 0.0,
+            annotations: Vec::new(),
+            current_bar_index: 0,
+            total_bars,
+            next_order_id: 1,
+            next_position_id: 1,
+        }
+    }
+
+    // ── Order submission ──────────────────────────────────────────────────────
+
+    pub fn submit_order(&mut self, side: Side, kind: OrderKind, qty: f64) -> OrderId {
+        let id = self.next_order_id;
+        self.next_order_id += 1;
+        self.open_orders.insert(
+            id,
+            Order {
+                id,
+                submitted_bar: self.current_bar_index,
+                side,
+                kind,
+                qty,
+                filled_qty: 0.0,
+                avg_fill_price: 0.0,
+                status: OrderStatus::Pending,
+                fills: Vec::new(),
+            },
+        );
+        id
+    }
+
+    pub fn cancel_order(&mut self, order_id: OrderId) -> bool {
+        if let Some(mut order) = self.open_orders.remove(&order_id) {
+            order.status = OrderStatus::Cancelled;
+            self.closed_orders.push(order);
+            true
+        } else {
+            false
+        }
+    }
+
+    // ── Fill application (called by host engine) ──────────────────────────────
+
+    /// Apply a (partial) fill to an order. Creates or updates the matching position.
+    /// Returns the fill commission.
+    pub fn apply_fill(&mut self, order_id: OrderId, fill_price: f32, fill_qty: f64) -> f64 {
+        let commission = fill_price as f64 * fill_qty * self.commission_rate;
+
+        let order = match self.open_orders.get_mut(&order_id) {
+            Some(o) => o,
+            None => return 0.0,
+        };
+
+        let fill = Fill {
+            bar_index: self.current_bar_index,
+            price: fill_price,
+            qty: fill_qty,
+            commission,
+        };
+
+        let prev_value = order.avg_fill_price * order.filled_qty;
+        order.filled_qty += fill_qty;
+        order.avg_fill_price = (prev_value + fill_price as f64 * fill_qty) / order.filled_qty;
+        order.fills.push(fill.clone());
+
+        if (order.qty - order.filled_qty).abs() < 1e-9 {
+            order.status = OrderStatus::Filled;
+        } else {
+            order.status = OrderStatus::PartiallyFilled;
+        }
+
+        let side = order.side;
+        let is_terminal = order.is_terminal();
+
+        if is_terminal {
+            let order = self.open_orders.remove(&order_id).unwrap();
+            self.closed_orders.push(order);
+        }
+
+        self.cash -= fill_price as f64 * fill_qty + commission;
+
+        if let Some(pos) = self.open_positions.iter_mut().find(|p| p.side == side) {
+            let prev_value = pos.avg_cost * pos.qty;
+            pos.qty += fill_qty;
+            pos.avg_cost = (prev_value + fill_price as f64 * fill_qty) / pos.qty;
+            pos.entry_fills.push(fill);
+        } else {
+            let id = self.next_position_id;
+            self.next_position_id += 1;
+            self.open_positions.push(Position {
+                id,
+                side,
+                open_bar: self.current_bar_index,
+                qty: fill_qty,
+                avg_cost: fill_price as f64,
+                entry_fills: vec![fill],
+                exit_fills: Vec::new(),
+            });
+        }
+
+        commission
+    }
+
+    // ── Position closing ──────────────────────────────────────────────────────
+
+    /// Close `close_qty` of the position with the given id at `exit_price`.
+    /// Generates a Trade record. Returns net pnl, or None if position not found.
+    pub fn close_position(
+        &mut self,
+        position_id: PositionId,
+        close_qty: f64,
+        exit_price: f32,
+    ) -> Option<f64> {
+        let pos_idx = self
+            .open_positions
+            .iter()
+            .position(|p| p.id == position_id)?;
+
+        let pos = &mut self.open_positions[pos_idx];
+        let actual_qty = close_qty.min(pos.qty);
+        let avg_entry = pos.avg_cost;
+        let side = pos.side;
+        let open_bar = pos.open_bar;
+
+        let commission = exit_price as f64 * actual_qty * self.commission_rate;
+        let gross_pnl = match side {
+            Side::Long => (exit_price as f64 - avg_entry) * actual_qty,
+            Side::Short => (avg_entry - exit_price as f64) * actual_qty,
+        };
+        let net_pnl = gross_pnl - commission;
+
+        pos.exit_fills.push(Fill {
+            bar_index: self.current_bar_index,
+            price: exit_price,
+            qty: actual_qty,
+            commission,
+        });
+        pos.qty -= actual_qty;
+
+        self.closed_trades.push(Trade {
+            position_id,
+            side,
+            open_bar,
+            close_bar: self.current_bar_index,
+            qty: actual_qty,
+            avg_entry,
+            avg_exit: exit_price as f64,
+            gross_pnl,
+            commission,
+            net_pnl,
+        });
+
+        if self.open_positions[pos_idx].qty < 1e-9 {
+            self.open_positions.remove(pos_idx);
+        }
+
+        self.cash += exit_price as f64 * actual_qty - commission;
+
+        Some(net_pnl)
+    }
+
+    // ── Equity snapshot (call once per bar after fills) ───────────────────────
+
+    pub fn snapshot_equity(&mut self, current_price: f32) {
+        let unrealized: f64 = self
+            .open_positions
+            .iter()
+            .map(|p| p.unrealized_pnl(current_price))
+            .sum();
+        let equity = self.cash + unrealized;
+        self.equity_curve.push(equity);
+
+        if equity > self.peak_equity {
+            self.peak_equity = equity;
+        }
+        let drawdown = self.peak_equity - equity;
+        if drawdown > self.max_drawdown {
+            self.max_drawdown = drawdown;
+        }
+    }
+
+    // ── Annotation helpers ────────────────────────────────────────────────────
+
+    pub fn annotate(&mut self, kind: AnnotationKind, price: f32, color: u32) {
+        self.annotations.push(Annotation {
+            bar_index: self.current_bar_index,
+            price,
+            color,
+            kind,
+        });
+    }
+
+    pub fn mark_buy(&mut self, price: f32) {
+        self.annotate(AnnotationKind::ArrowUp, price, 0xFF00CC44);
+    }
+
+    pub fn mark_sell(&mut self, price: f32) {
+        self.annotate(AnnotationKind::ArrowDown, price, 0xFFCC2200);
+    }
+
+    // ── Convenience queries ───────────────────────────────────────────────────
+
+    pub fn equity(&self, current_price: f32) -> f64 {
+        let unrealized: f64 = self
+            .open_positions
+            .iter()
+            .map(|p| p.unrealized_pnl(current_price))
+            .sum();
+        self.cash + unrealized
+    }
+
+    pub fn position_by_id(&self, id: PositionId) -> Option<&Position> {
+        self.open_positions.iter().find(|p| p.id == id)
+    }
+
+    pub fn order_by_id(&self, id: OrderId) -> Option<&Order> {
+        self.open_orders
+            .get(&id)
+            .or_else(|| self.closed_orders.iter().find(|o| o.id == id))
+    }
+
+    pub fn long_positions(&self) -> impl Iterator<Item = &Position> {
+        self.open_positions.iter().filter(|p| p.side == Side::Long)
+    }
+
+    pub fn short_positions(&self) -> impl Iterator<Item = &Position> {
+        self.open_positions.iter().filter(|p| p.side == Side::Short)
     }
 }
 
 impl Default for BacktestCtx {
     fn default() -> Self {
-        Self::new()
+        Self::new(100_000.0, 0.001, 0.0, 0)
     }
 }
