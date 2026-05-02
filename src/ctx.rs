@@ -230,12 +230,16 @@ impl BacktestCtx {
     /// Apply a (partial) fill to an order. Creates or updates the matching position.
     /// Returns the fill commission.
     pub fn apply_fill(&mut self, order_id: OrderId, fill_price: f32, fill_qty: f64) -> f64 {
-        let commission = fill_price as f64 * fill_qty * self.commission_rate;
-
         let order = match self.open_orders.get_mut(&order_id) {
             Some(o) => o,
             None => return 0.0,
         };
+
+        let fill_qty = fill_qty.min(order.remaining_qty());
+        if fill_qty <= 0.0 {
+            return 0.0;
+        }
+        let commission = fill_price as f64 * fill_qty * self.commission_rate;
 
         let fill = Fill {
             bar_index: self.current_bar_index,
