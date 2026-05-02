@@ -13,6 +13,140 @@ pub enum Side {
     Short,
 }
 
+// ── Account trait ─────────────────────────────────────────────────────────────
+
+pub trait Account {
+    fn initial_capital(&self) -> f64;
+    fn cash(&self) -> f64;
+    fn commission_rate(&self) -> f64;
+    fn slippage(&self) -> f32;
+
+    /// Deduct cost of opening a position. Returns the margin reserved.
+    /// `notional` = fill_price * fill_qty
+    fn deduct_open(&mut self, notional: f64, commission: f64) -> f64;
+
+    /// Return funds after closing a position.
+    /// `released_margin` is the proportional margin from the position being closed.
+    fn refund_close(&mut self, released_margin: f64, net_pnl: f64);
+
+    /// Check whether any positions should be liquidated given current price.
+    /// Returns ids of positions to force-close, worst PnL first.
+    /// Spot accounts always return empty (no liquidation).
+    fn liquidation_candidates(
+        &self,
+        positions: &[Position],
+        current_price: f32,
+    ) -> Vec<PositionId>;
+
+    /// Called after a liquidation force-close to update internal state.
+    /// `released_margin` is the full margin of the liquidated position.
+    fn on_liquidation(&mut self, released_margin: f64, net_pnl: f64);
+}
+
+// ── SpotAccount ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SpotAccount {
+    pub initial_capital: f64,
+    pub cash: f64,
+    pub commission_rate: f64,
+    pub slippage: f32,
+}
+
+impl SpotAccount {
+    pub fn new(initial_capital: f64, commission_rate: f64, slippage: f32) -> Self {
+        Self { initial_capital, cash: initial_capital, commission_rate, slippage }
+    }
+}
+
+impl Account for SpotAccount {
+    fn initial_capital(&self) -> f64 { self.initial_capital }
+    fn cash(&self) -> f64 { self.cash }
+    fn commission_rate(&self) -> f64 { self.commission_rate }
+    fn slippage(&self) -> f32 { self.slippage }
+
+    fn deduct_open(&mut self, notional: f64, commission: f64) -> f64 {
+        // Full margin: lock entire notional value
+        let margin = notional;
+        self.cash -= margin + commission;
+        margin
+    }
+
+    fn refund_close(&mut self, released_margin: f64, net_pnl: f64) {
+        self.cash += released_margin + net_pnl;
+    }
+
+    fn liquidation_candidates(&self, _positions: &[Position], _current_price: f32) -> Vec<PositionId> {
+        Vec::new()
+    }
+
+    fn on_liquidation(&mut self, released_margin: f64, net_pnl: f64) {
+        self.cash += released_margin + net_pnl;
+        if self.cash < 0.0 {
+            self.cash = 0.0;
+        }
+    }
+}
+
+// ── FuturesAccount ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct FuturesAccount {
+    pub initial_capital: f64,
+    pub cash: f64,
+    pub commission_rate: f64,
+    pub slippage: f32,
+    pub leverage: f64,
+}
+
+impl FuturesAccount {
+    pub fn new(initial_capital: f64, commission_rate: f64, slippage: f32, leverage: f64) -> Self {
+        Self { initial_capital, cash: initial_capital, commission_rate, slippage, leverage }
+    }
+}
+
+impl Account for FuturesAccount {
+    fn initial_capital(&self) -> f64 { self.initial_capital }
+    fn cash(&self) -> f64 { self.cash }
+    fn commission_rate(&self) -> f64 { self.commission_rate }
+    fn slippage(&self) -> f32 { self.slippage }
+
+    fn deduct_open(&mut self, notional: f64, commission: f64) -> f64 {
+        let margin = notional / self.leverage;
+        self.cash -= margin + commission;
+        margin
+    }
+
+    fn refund_close(&mut self, released_margin: f64, net_pnl: f64) {
+        self.cash += released_margin + net_pnl;
+    }
+
+    fn liquidation_candidates(&self, positions: &[Position], current_price: f32) -> Vec<PositionId> {
+        let unrealized: f64 = positions.iter().map(|p| p.unrealized_pnl(current_price)).sum();
+        let equity = self.cash + unrealized;
+        let total_maintenance: f64 = positions.iter().map(|p| p.margin).sum();
+
+        if equity >= total_maintenance {
+            return Vec::new();
+        }
+
+        // Sort by unrealized pnl ascending (worst first)
+        let mut candidates: Vec<(PositionId, f64)> = positions
+            .iter()
+            .map(|p| (p.id, p.unrealized_pnl(current_price)))
+            .collect();
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        candidates.into_iter().map(|(id, _)| id).collect()
+    }
+
+    fn on_liquidation(&mut self, released_margin: f64, net_pnl: f64) {
+        self.cash += released_margin + net_pnl;
+        if self.cash < 0.0 {
+            self.cash = 0.0;
+        }
+    }
+}
+
 // ── Order ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -46,11 +180,8 @@ pub struct Order {
     pub submitted_bar: usize,
     pub side: Side,
     pub kind: OrderKind,
-    /// Total requested quantity.
     pub qty: f64,
-    /// Quantity successfully filled so far.
     pub filled_qty: f64,
-    /// Volume-weighted average fill price across all fills.
     pub avg_fill_price: f64,
     pub status: OrderStatus,
     pub fills: Vec<Fill>,
@@ -76,13 +207,11 @@ pub struct Position {
     pub id: PositionId,
     pub side: Side,
     pub open_bar: usize,
-    /// Current remaining quantity (decreases on partial close).
     pub qty: f64,
-    /// Volume-weighted average entry cost across all entry fills.
     pub avg_cost: f64,
-    /// All fills that opened or added to this position.
+    /// Margin reserved for this position (cash locked).
+    pub margin: f64,
     pub entry_fills: Vec<Fill>,
-    /// All fills that partially or fully closed this position.
     pub exit_fills: Vec<Fill>,
 }
 
@@ -96,7 +225,19 @@ impl Position {
     }
 }
 
-// ── Trade (closed position record) ────────────────────────────────────────────
+// ── Liquidation record ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Liquidation {
+    pub position_id: PositionId,
+    pub bar_index: usize,
+    pub side: Side,
+    pub qty: f64,
+    pub price: f32,
+    pub loss: f64,
+}
+
+// ── Trade ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct Trade {
@@ -104,7 +245,6 @@ pub struct Trade {
     pub side: Side,
     pub open_bar: usize,
     pub close_bar: usize,
-    /// Quantity closed in this trade record (may be partial).
     pub qty: f64,
     pub avg_entry: f64,
     pub avg_exit: f64,
@@ -134,11 +274,7 @@ pub struct Annotation {
 // ── BacktestCtx ───────────────────────────────────────────────────────────────
 
 pub struct BacktestCtx {
-    // Account
-    pub initial_capital: f64,
-    pub cash: f64,
-    pub commission_rate: f64,
-    pub slippage: f32,
+    pub account: Box<dyn Account>,
 
     // Live orders: Pending or PartiallyFilled, keyed by order id
     pub open_orders: FxHashMap<OrderId, Order>,
@@ -147,8 +283,10 @@ pub struct BacktestCtx {
 
     // Open positions (Long and Short can coexist)
     pub open_positions: Vec<Position>,
-    // Completed trade records (fully or partially closed positions)
+    // Completed trade records
     pub closed_trades: Vec<Trade>,
+    // Liquidation records
+    pub liquidations: Vec<Liquidation>,
 
     // Equity tracking
     pub equity_curve: Vec<f64>,
@@ -167,23 +305,18 @@ pub struct BacktestCtx {
 }
 
 impl BacktestCtx {
-    pub fn new(
-        initial_capital: f64,
-        commission_rate: f64,
-        slippage: f32,
-        total_bars: usize,
-    ) -> Self {
+    pub fn new(account: impl Account + 'static, total_bars: usize) -> Self {
+        let peak_equity = account.initial_capital();
+        let account: Box<dyn Account> = Box::new(account);
         Self {
-            initial_capital,
-            cash: initial_capital,
-            commission_rate,
-            slippage,
+            account,
             open_orders: FxHashMap::default(),
             closed_orders: Vec::new(),
             open_positions: Vec::new(),
             closed_trades: Vec::new(),
+            liquidations: Vec::new(),
             equity_curve: Vec::with_capacity(total_bars),
-            peak_equity: initial_capital,
+            peak_equity,
             max_drawdown: 0.0,
             annotations: Vec::new(),
             current_bar_index: 0,
@@ -239,7 +372,7 @@ impl BacktestCtx {
         if fill_qty <= 0.0 {
             return 0.0;
         }
-        let commission = fill_price as f64 * fill_qty * self.commission_rate;
+        let commission = fill_price as f64 * fill_qty * self.account.commission_rate();
 
         let fill = Fill {
             bar_index: self.current_bar_index,
@@ -267,12 +400,14 @@ impl BacktestCtx {
             self.closed_orders.push(order);
         }
 
-        self.cash -= fill_price as f64 * fill_qty + commission;
+        let notional = fill_price as f64 * fill_qty;
+        let margin = self.account.deduct_open(notional, commission);
 
         if let Some(pos) = self.open_positions.iter_mut().find(|p| p.side == side) {
             let prev_value = pos.avg_cost * pos.qty;
             pos.qty += fill_qty;
             pos.avg_cost = (prev_value + fill_price as f64 * fill_qty) / pos.qty;
+            pos.margin += margin;
             pos.entry_fills.push(fill);
         } else {
             let id = self.next_position_id;
@@ -283,6 +418,7 @@ impl BacktestCtx {
                 open_bar: self.current_bar_index,
                 qty: fill_qty,
                 avg_cost: fill_price as f64,
+                margin,
                 entry_fills: vec![fill],
                 exit_fills: Vec::new(),
             });
@@ -293,8 +429,8 @@ impl BacktestCtx {
 
     // ── Position closing ──────────────────────────────────────────────────────
 
-    /// Close `close_qty` of the position with the given id at `exit_price`.
-    /// Generates a Trade record. Returns net pnl, or None if position not found.
+    /// Close `close_qty` of the position at `exit_price`.
+    /// Returns net pnl, or None if position not found.
     pub fn close_position(
         &mut self,
         position_id: PositionId,
@@ -311,8 +447,9 @@ impl BacktestCtx {
         let avg_entry = pos.avg_cost;
         let side = pos.side;
         let open_bar = pos.open_bar;
+        let released_margin = pos.margin * (actual_qty / pos.qty);
 
-        let commission = exit_price as f64 * actual_qty * self.commission_rate;
+        let commission = exit_price as f64 * actual_qty * self.account.commission_rate();
         let gross_pnl = match side {
             Side::Long => (exit_price as f64 - avg_entry) * actual_qty,
             Side::Short => (avg_entry - exit_price as f64) * actual_qty,
@@ -326,6 +463,7 @@ impl BacktestCtx {
             commission,
         });
         pos.qty -= actual_qty;
+        pos.margin -= released_margin;
 
         self.closed_trades.push(Trade {
             position_id,
@@ -344,20 +482,97 @@ impl BacktestCtx {
             self.open_positions.remove(pos_idx);
         }
 
-        self.cash += exit_price as f64 * actual_qty - commission;
+        self.account.refund_close(released_margin, net_pnl);
 
         Some(net_pnl)
+    }
+
+    // ── Liquidation check (call once per bar) ─────────────────────────────────
+
+    /// Check all open positions for liquidation at `current_price`.
+    /// Liquidated positions are force-closed and recorded in `liquidations`.
+    /// Returns the ids of liquidated positions.
+    pub fn check_liquidation(&mut self, current_price: f32) -> Vec<PositionId> {
+        let candidates = self.account.liquidation_candidates(&self.open_positions, current_price);
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let mut liquidated = Vec::new();
+
+        for pos_id in candidates {
+            // Re-check after each close since equity changes
+            let still_needed = {
+                let unrealized: f64 = self.open_positions.iter().map(|p| p.unrealized_pnl(current_price)).sum();
+                let equity = self.account.cash() + unrealized;
+                let total_maintenance: f64 = self.open_positions.iter().map(|p| p.margin).sum();
+                equity < total_maintenance
+            };
+            if !still_needed {
+                break;
+            }
+
+            let pos_idx = match self.open_positions.iter().position(|p| p.id == pos_id) {
+                Some(i) => i,
+                None => continue,
+            };
+
+            let pos = &self.open_positions[pos_idx];
+            let qty = pos.qty;
+            let side = pos.side;
+            let margin = pos.margin;
+            let avg_cost = pos.avg_cost;
+            let open_bar = pos.open_bar;
+
+            let commission = current_price as f64 * qty * self.account.commission_rate();
+            let gross_pnl = match side {
+                Side::Long => (current_price as f64 - avg_cost) * qty,
+                Side::Short => (avg_cost - current_price as f64) * qty,
+            };
+            let net_pnl = gross_pnl - commission;
+            let loss = -net_pnl.min(0.0);
+
+            self.open_positions[pos_idx].exit_fills.push(Fill {
+                bar_index: self.current_bar_index,
+                price: current_price,
+                qty,
+                commission,
+            });
+            self.open_positions.remove(pos_idx);
+
+            self.liquidations.push(Liquidation {
+                position_id: pos_id,
+                bar_index: self.current_bar_index,
+                side,
+                qty,
+                price: current_price,
+                loss,
+            });
+
+            self.closed_trades.push(Trade {
+                position_id: pos_id,
+                side,
+                open_bar,
+                close_bar: self.current_bar_index,
+                qty,
+                avg_entry: avg_cost,
+                avg_exit: current_price as f64,
+                gross_pnl,
+                commission,
+                net_pnl,
+            });
+
+            self.account.on_liquidation(margin, net_pnl);
+            liquidated.push(pos_id);
+        }
+
+        liquidated
     }
 
     // ── Equity snapshot (call once per bar after fills) ───────────────────────
 
     pub fn snapshot_equity(&mut self, current_price: f32) {
-        let unrealized: f64 = self
-            .open_positions
-            .iter()
-            .map(|p| p.unrealized_pnl(current_price))
-            .sum();
-        let equity = self.cash + unrealized;
+        let equity = self.equity(current_price);
         self.equity_curve.push(equity);
 
         if equity > self.peak_equity {
@@ -396,7 +611,11 @@ impl BacktestCtx {
             .iter()
             .map(|p| p.unrealized_pnl(current_price))
             .sum();
-        self.cash + unrealized
+        self.account.cash() + unrealized
+    }
+
+    pub fn margin_used(&self) -> f64 {
+        self.open_positions.iter().map(|p| p.margin).sum()
     }
 
     pub fn position_by_id(&self, id: PositionId) -> Option<&Position> {
@@ -420,6 +639,6 @@ impl BacktestCtx {
 
 impl Default for BacktestCtx {
     fn default() -> Self {
-        Self::new(100_000.0, 0.001, 0.0, 0)
+        Self::new(SpotAccount::new(100_000.0, 0.001, 0.0), 0)
     }
 }
