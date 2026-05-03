@@ -266,7 +266,7 @@ pub struct Annotation {
 }
 
 // ── BacktestCtx ───────────────────────────────────────────────────────────────
-
+#[derive(Debug, Clone)]
 pub struct BacktestCtx {
     pub account: Account,
 
