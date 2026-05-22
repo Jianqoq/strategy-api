@@ -25,7 +25,12 @@ pub struct SpotAccount {
 
 impl SpotAccount {
     pub fn new(initial_capital: f64, commission_rate: f64, slippage: f32) -> Self {
-        Self { initial_capital, cash: initial_capital, commission_rate, slippage }
+        Self {
+            initial_capital,
+            cash: initial_capital,
+            commission_rate,
+            slippage,
+        }
     }
 }
 
@@ -40,7 +45,13 @@ pub struct FuturesAccount {
 
 impl FuturesAccount {
     pub fn new(initial_capital: f64, commission_rate: f64, slippage: f32, leverage: f64) -> Self {
-        Self { initial_capital, cash: initial_capital, commission_rate, slippage, leverage }
+        Self {
+            initial_capital,
+            cash: initial_capital,
+            commission_rate,
+            slippage,
+            leverage,
+        }
     }
 }
 
@@ -105,11 +116,18 @@ impl Account {
 
     /// Return ids of positions to liquidate (worst PnL first).
     /// Spot always returns empty.
-    fn liquidation_candidates(&self, positions: &[Position], current_price: f32) -> Vec<PositionId> {
+    fn liquidation_candidates(
+        &self,
+        positions: &[Position],
+        current_price: f32,
+    ) -> Vec<PositionId> {
         match self {
             Account::Spot(_) => Vec::new(),
             Account::Futures(a) => {
-                let unrealized: f64 = positions.iter().map(|p| p.unrealized_pnl(current_price)).sum();
+                let unrealized: f64 = positions
+                    .iter()
+                    .map(|p| p.unrealized_pnl(current_price))
+                    .sum();
                 let equity = a.cash + unrealized;
                 let total_maintenance: f64 = positions.iter().map(|p| p.margin).sum();
 
@@ -131,11 +149,15 @@ impl Account {
         match self {
             Account::Spot(a) => {
                 a.cash += released_margin + net_pnl;
-                if a.cash < 0.0 { a.cash = 0.0; }
+                if a.cash < 0.0 {
+                    a.cash = 0.0;
+                }
             }
             Account::Futures(a) => {
                 a.cash += released_margin + net_pnl;
-                if a.cash < 0.0 { a.cash = 0.0; }
+                if a.cash < 0.0 {
+                    a.cash = 0.0;
+                }
             }
         }
     }
@@ -486,7 +508,9 @@ impl BacktestCtx {
     /// Only relevant for `Account::Futures`; spot accounts are no-ops.
     /// Returns the ids of liquidated positions.
     pub fn check_liquidation(&mut self, current_price: f32) -> Vec<PositionId> {
-        let candidates = self.account.liquidation_candidates(&self.open_positions, current_price);
+        let candidates = self
+            .account
+            .liquidation_candidates(&self.open_positions, current_price);
         if candidates.is_empty() {
             return Vec::new();
         }
@@ -495,7 +519,11 @@ impl BacktestCtx {
 
         for pos_id in candidates {
             let still_needed = {
-                let unrealized: f64 = self.open_positions.iter().map(|p| p.unrealized_pnl(current_price)).sum();
+                let unrealized: f64 = self
+                    .open_positions
+                    .iter()
+                    .map(|p| p.unrealized_pnl(current_price))
+                    .sum();
                 let equity = self.account.cash() + unrealized;
                 let total_maintenance: f64 = self.open_positions.iter().map(|p| p.margin).sum();
                 equity < total_maintenance

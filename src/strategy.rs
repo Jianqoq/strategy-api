@@ -1,4 +1,4 @@
-use crate::{Bar, BacktestCtx};
+use crate::{BacktestCtx, Bar};
 
 // ── Signal ────────────────────────────────────────────────────────────────────
 
@@ -7,6 +7,12 @@ pub type Signal = i32;
 pub const BUY: Signal = 1;
 pub const SELL: Signal = -1;
 pub const HOLD: Signal = 0;
+
+#[repr(C)]
+pub struct StateBlob {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
 
 // ── Metadata ──────────────────────────────────────────────────────────────────
 
@@ -67,7 +73,7 @@ pub trait Strategy {
     fn on_bar(&mut self, bar: &Bar, index: usize, ctx: &mut BacktestCtx);
 
     /// Called once after the last bar. Use this to draw final annotations.
-    fn on_finish(&mut self, ctx: &mut BacktestCtx);
+    fn on_finish(&mut self, ctx: &mut BacktestCtx) -> Vec<u8>;
 }
 
 // ── Export macro ──────────────────────────────────────────────────────────────
@@ -131,14 +137,14 @@ macro_rules! export_strategy {
         pub extern "C" fn strategy_info() -> $crate::StrategyInfo {
             let name = <$ty as $crate::Strategy>::name();
             let desc = <$ty as $crate::Strategy>::description();
-            let ver  = <$ty as $crate::Strategy>::version();
+            let ver = <$ty as $crate::Strategy>::version();
             $crate::StrategyInfo {
-                name:            name.as_ptr(),
-                name_len:        name.len(),
-                description:     desc.as_ptr(),
+                name: name.as_ptr(),
+                name_len: name.len(),
+                description: desc.as_ptr(),
                 description_len: desc.len(),
-                version:         ver.as_ptr(),
-                version_len:     ver.len(),
+                version: ver.as_ptr(),
+                version_len: ver.len(),
             }
         }
 
@@ -159,9 +165,14 @@ macro_rules! export_strategy {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn on_finish(ctx: *mut $crate::BacktestCtx) {
+        pub extern "C" fn on_finish(ctx: *mut $crate::BacktestCtx) -> $crate::StateBlob {
             let ctx = unsafe { &mut *ctx };
-            <$ty as $crate::Strategy>::on_finish(&mut *get_instance(), ctx);
+            let state = <$ty as $crate::Strategy>::on_finish(&mut *get_instance(), ctx);
+            let mut bytes = ManuallyDrop::new(state);
+            $crate::StateBlob {
+                ptr: bytes.as_mut_ptr(),
+                len: bytes.len(),
+            }
         }
     };
 }

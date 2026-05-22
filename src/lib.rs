@@ -4,8 +4,8 @@ pub mod strategy;
 
 pub use bar::Bar;
 pub use ctx::{
-    Account, Annotation, AnnotationKind, BacktestCtx, Fill, FuturesAccount, Liquidation,
-    Order, OrderId, OrderKind, OrderStatus, Position, PositionId, Side, SpotAccount, Trade,
+    Account, Annotation, AnnotationKind, BacktestCtx, Fill, FuturesAccount, Liquidation, Order,
+    OrderId, OrderKind, OrderStatus, Position, PositionId, Side, SpotAccount, Trade,
 };
 
 pub use strategy::{
