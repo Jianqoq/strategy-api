@@ -168,7 +168,7 @@ macro_rules! export_strategy {
         pub extern "C" fn on_finish(ctx: *mut $crate::BacktestCtx) -> $crate::StateBlob {
             let ctx = unsafe { &mut *ctx };
             let state = <$ty as $crate::Strategy>::on_finish(&mut *get_instance(), ctx);
-            let mut bytes = ManuallyDrop::new(state);
+            let mut bytes = std::mem::ManuallyDrop::new(state);
             $crate::StateBlob {
                 ptr: bytes.as_mut_ptr(),
                 len: bytes.len(),
