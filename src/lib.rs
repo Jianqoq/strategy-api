@@ -9,5 +9,6 @@ pub use ctx::{
 };
 
 pub use strategy::{
-    BUY, FnOnBar, FnOnFinish, FnOnInit, FnStrategyInfo, HOLD, SELL, Signal, Strategy, StrategyInfo,
+    BUY, FnOnBar, FnOnFinish, FnOnInit, FnStrategyInfo, HOLD, SELL, Signal, StateBlob, Strategy,
+    StrategyInfo,
 };
