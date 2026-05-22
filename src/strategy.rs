@@ -1,4 +1,4 @@
-use crate::{StrategyCtx, Bar};
+use crate::{Bar, Context};
 
 // ── Signal ────────────────────────────────────────────────────────────────────
 
@@ -30,8 +30,8 @@ pub struct StrategyInfo {
 
 pub type FnStrategyInfo = unsafe extern "C" fn() -> StrategyInfo;
 pub type FnOnInit = unsafe extern "C" fn(total_bars: usize);
-pub type FnOnBar = unsafe extern "C" fn(bar: *const Bar, index: usize, ctx: *mut StrategyCtx);
-pub type FnOnFinish = unsafe extern "C" fn(ctx: *mut StrategyCtx);
+pub type FnOnBar = unsafe extern "C" fn(bar: *const Bar, index: usize, ctx: *mut Context);
+pub type FnOnFinish = unsafe extern "C" fn(ctx: *mut Context);
 
 // ── OnBar trait ────────────────────────────────────────────────────────────
 
@@ -70,10 +70,10 @@ pub trait OnBar {
     /// - `ctx`   — drawing context; call `ctx.line()`, `ctx.circle()`, etc.
     ///
     /// Return `BUY`, `SELL`, or `HOLD`.
-    fn on_bar(&mut self, bar: &Bar, index: usize, ctx: &mut StrategyCtx);
+    fn on_bar(&mut self, bar: &Bar, index: usize, ctx: &mut Context);
 
     /// Called once after the last bar. Use this to draw final annotations.
-    fn on_finish(&mut self, ctx: &mut StrategyCtx) -> Vec<u8>;
+    fn on_finish(&mut self, ctx: &mut Context) -> Vec<u8>;
 }
 
 // ── Export macro ──────────────────────────────────────────────────────────────
@@ -154,11 +154,7 @@ macro_rules! export_strategy {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn on_bar(
-            bar: *const $crate::Bar,
-            index: usize,
-            ctx: *mut $crate::Context,
-        ) {
+        pub extern "C" fn on_bar(bar: *const $crate::Bar, index: usize, ctx: *mut $crate::Context) {
             let bar = unsafe { &*bar };
             let ctx = unsafe { &mut *ctx };
             <$ty as $crate::OnBar>::on_bar(&mut *get_instance(), bar, index, ctx)
