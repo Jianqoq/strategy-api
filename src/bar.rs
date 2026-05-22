@@ -15,5 +15,6 @@ pub struct Bar {
 
 pub struct Point {
     pub index: usize,
-    pub price: f32
+    pub price: f32,
+    pub color: [u8; 4],
 }
