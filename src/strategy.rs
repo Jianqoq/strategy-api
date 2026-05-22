@@ -60,6 +60,8 @@ pub trait OnBar {
     where
         Self: Sized;
 
+    fn restore_state(&mut self, state: StateBlob);
+
     /// Called once before the first bar. Use this to reset any state.
     fn init(&mut self, total_bars: usize);
 
@@ -151,6 +153,11 @@ macro_rules! export_strategy {
         #[unsafe(no_mangle)]
         pub extern "C" fn on_init(total_bars: usize) {
             <$ty as $crate::OnBar>::init(&mut *get_instance(), total_bars);
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn restore_state(state: $crate::StateBlob) {
+            <$ty as $crate::OnBar>::restore_state(&mut *get_instance(), state);
         }
 
         #[unsafe(no_mangle)]
