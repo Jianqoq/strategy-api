@@ -295,7 +295,7 @@ pub struct Context {
 }
 
 pub struct DrawContext {
-    pub series: FxHashMap<String, Vec<Point>>,
+    pub series: FxHashMap<&'static str, Vec<Point>>,
 }
 
 // ── StrategyCtx ───────────────────────────────────────────────────────────────
