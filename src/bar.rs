@@ -12,3 +12,8 @@ pub struct Bar {
     pub close: f32,
     pub volume: f64,
 }
+
+pub struct Point {
+    pub index: usize,
+    pub price: f32
+}

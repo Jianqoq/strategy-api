@@ -1,4 +1,4 @@
-use crate::{BacktestCtx, Bar};
+use crate::{StrategyCtx, Bar};
 
 // ── Signal ────────────────────────────────────────────────────────────────────
 
@@ -30,16 +30,16 @@ pub struct StrategyInfo {
 
 pub type FnStrategyInfo = unsafe extern "C" fn() -> StrategyInfo;
 pub type FnOnInit = unsafe extern "C" fn(total_bars: usize);
-pub type FnOnBar = unsafe extern "C" fn(bar: *const Bar, index: usize, ctx: *mut BacktestCtx);
-pub type FnOnFinish = unsafe extern "C" fn(ctx: *mut BacktestCtx);
+pub type FnOnBar = unsafe extern "C" fn(bar: *const Bar, index: usize, ctx: *mut StrategyCtx);
+pub type FnOnFinish = unsafe extern "C" fn(ctx: *mut StrategyCtx);
 
-// ── Strategy trait ────────────────────────────────────────────────────────────
+// ── OnBar trait ────────────────────────────────────────────────────────────
 
 /// Implement this trait in your DLL, then call `export_strategy!(YourType)`.
 ///
 /// All methods are called from the host's main thread in order:
 ///   `new` → `init` → `on_bar` × N → `on_finish`
-pub trait Strategy {
+pub trait OnBar {
     /// Construct the strategy. Called once when the DLL singleton is first accessed.
     fn new() -> Self
     where
@@ -70,28 +70,28 @@ pub trait Strategy {
     /// - `ctx`   — drawing context; call `ctx.line()`, `ctx.circle()`, etc.
     ///
     /// Return `BUY`, `SELL`, or `HOLD`.
-    fn on_bar(&mut self, bar: &Bar, index: usize, ctx: &mut BacktestCtx);
+    fn on_bar(&mut self, bar: &Bar, index: usize, ctx: &mut StrategyCtx);
 
     /// Called once after the last bar. Use this to draw final annotations.
-    fn on_finish(&mut self, ctx: &mut BacktestCtx) -> Vec<u8>;
+    fn on_finish(&mut self, ctx: &mut StrategyCtx) -> Vec<u8>;
 }
 
 // ── Export macro ──────────────────────────────────────────────────────────────
 
-/// Wire up a [`Strategy`] impl as a loadable DLL.
+/// Wire up a [`OnBar`] impl as a loadable DLL.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use strategy_api::{Bar, BacktestCtx, OrderKind, Side, Strategy, export_strategy};
+/// use strategy_api::{Bar, BacktestCtx, OrderKind, Side, OnBar, export_strategy};
 ///
 /// struct MyStrategy {
 ///     prev_close: f32,
 /// }
 ///
-/// impl Strategy for MyStrategy {
+/// impl OnBar for MyStrategy {
 ///     fn new() -> Self { Self { prev_close: 0.0 } }
-///     fn name()        -> &'static str { "My Strategy" }
+///     fn name()        -> &'static str { "My OnBar" }
 ///     fn description() -> &'static str { "Buy on up-close, sell on down-close." }
 ///     fn version()     -> &'static str { "1.0.0" }
 ///
@@ -119,7 +119,7 @@ pub trait Strategy {
 macro_rules! export_strategy {
     ($ty:ty) => {
         const _: fn() = || {
-            fn assert_strategy<T: $crate::Strategy>() {}
+            fn assert_strategy<T: $crate::OnBar>() {}
             assert_strategy::<$ty>();
         };
 
@@ -128,16 +128,16 @@ macro_rules! export_strategy {
 
         fn get_instance() -> ::std::sync::MutexGuard<'static, $ty> {
             INSTANCE
-                .get_or_init(|| ::std::sync::Mutex::new(<$ty as $crate::Strategy>::new()))
+                .get_or_init(|| ::std::sync::Mutex::new(<$ty as $crate::OnBar>::new()))
                 .lock()
                 .expect("strategy mutex poisoned")
         }
 
         #[unsafe(no_mangle)]
         pub extern "C" fn strategy_info() -> $crate::StrategyInfo {
-            let name = <$ty as $crate::Strategy>::name();
-            let desc = <$ty as $crate::Strategy>::description();
-            let ver = <$ty as $crate::Strategy>::version();
+            let name = <$ty as $crate::OnBar>::name();
+            let desc = <$ty as $crate::OnBar>::description();
+            let ver = <$ty as $crate::OnBar>::version();
             $crate::StrategyInfo {
                 name: name.as_ptr(),
                 name_len: name.len(),
@@ -150,24 +150,24 @@ macro_rules! export_strategy {
 
         #[unsafe(no_mangle)]
         pub extern "C" fn on_init(total_bars: usize) {
-            <$ty as $crate::Strategy>::init(&mut *get_instance(), total_bars);
+            <$ty as $crate::OnBar>::init(&mut *get_instance(), total_bars);
         }
 
         #[unsafe(no_mangle)]
         pub extern "C" fn on_bar(
             bar: *const $crate::Bar,
             index: usize,
-            ctx: *mut $crate::BacktestCtx,
+            ctx: *mut $crate::Context,
         ) {
             let bar = unsafe { &*bar };
             let ctx = unsafe { &mut *ctx };
-            <$ty as $crate::Strategy>::on_bar(&mut *get_instance(), bar, index, ctx)
+            <$ty as $crate::OnBar>::on_bar(&mut *get_instance(), bar, index, ctx)
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn on_finish(ctx: *mut $crate::BacktestCtx) -> $crate::StateBlob {
+        pub extern "C" fn on_finish(ctx: *mut $crate::Context) -> $crate::StateBlob {
             let ctx = unsafe { &mut *ctx };
-            let state = <$ty as $crate::Strategy>::on_finish(&mut *get_instance(), ctx);
+            let state = <$ty as $crate::OnBar>::on_finish(&mut *get_instance(), ctx);
             let mut bytes = std::mem::ManuallyDrop::new(state);
             $crate::StateBlob {
                 ptr: bytes.as_mut_ptr(),

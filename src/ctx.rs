@@ -1,5 +1,7 @@
 use rustc_hash::FxHashMap;
 
+use crate::bar::Point;
+
 // ── Identifiers ───────────────────────────────────────────────────────────────
 
 pub type OrderId = u64;
@@ -287,9 +289,18 @@ pub struct Annotation {
     pub kind: AnnotationKind,
 }
 
-// ── BacktestCtx ───────────────────────────────────────────────────────────────
+pub struct Context {
+    pub draw: DrawContext,
+    pub strategy: StrategyCtx,
+}
+
+pub struct DrawContext {
+    pub series: Vec<Point>,
+}
+
+// ── StrategyCtx ───────────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
-pub struct BacktestCtx {
+pub struct StrategyCtx {
     pub account: Account,
 
     // Live orders: Pending or PartiallyFilled, keyed by order id
@@ -320,7 +331,7 @@ pub struct BacktestCtx {
     next_position_id: PositionId,
 }
 
-impl BacktestCtx {
+impl StrategyCtx {
     pub fn new(account: Account, total_bars: usize) -> Self {
         let peak_equity = account.initial_capital();
         Self {
@@ -657,7 +668,7 @@ impl BacktestCtx {
     }
 }
 
-impl Default for BacktestCtx {
+impl Default for StrategyCtx {
     fn default() -> Self {
         Self::new(Account::Spot(SpotAccount::new(100_000.0, 0.001, 0.0)), 0)
     }
