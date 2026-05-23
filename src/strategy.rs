@@ -126,21 +126,11 @@ macro_rules! export_strategy {
         static STRATEGY_INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$ty>> =
             ::std::sync::OnceLock::new();
 
-        static INDICATOR_INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$ty>> =
-            ::std::sync::OnceLock::new();
-
         fn get_strategy_instance() -> ::std::sync::MutexGuard<'static, $ty> {
             STRATEGY_INSTANCE
                 .get_or_init(|| ::std::sync::Mutex::new(<$ty as $crate::OnStrategy>::new()))
                 .lock()
                 .expect("strategy mutex poisoned")
-        }
-
-        fn get_indicator_instance() -> ::std::sync::MutexGuard<'static, $ty> {
-            INDICATOR_INSTANCE
-                .get_or_init(|| ::std::sync::Mutex::new(<$ty as $crate::OnIndicator>::new()))
-                .lock()
-                .expect("indicator mutex poisoned")
         }
 
         #[unsafe(no_mangle)]
@@ -173,6 +163,26 @@ macro_rules! export_strategy {
                 ptr: bytes.as_mut_ptr(),
                 len: bytes.len(),
             }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! export_indicator {
+    ($ty:ty) => {
+        const _: fn() = || {
+            fn assert_indicator<T: $crate::OnIndicator>() {}
+            assert_indicator::<$ty>();
+        };
+
+        static INDICATOR_INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$ty>> =
+            ::std::sync::OnceLock::new();
+
+        fn get_indicator_instance() -> ::std::sync::MutexGuard<'static, $ty> {
+            INDICATOR_INSTANCE
+                .get_or_init(|| ::std::sync::Mutex::new(<$ty as $crate::OnIndicator>::new()))
+                .lock()
+                .expect("indicator mutex poisoned")
         }
 
         #[unsafe(no_mangle)]
