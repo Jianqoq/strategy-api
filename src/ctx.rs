@@ -289,18 +289,13 @@ pub struct Annotation {
     pub kind: AnnotationKind,
 }
 
-pub struct Context {
-    pub draw: DrawContext,
-    pub strategy: StrategyCtx,
-}
-
-pub struct DrawContext {
+pub struct Indicator {
     pub series: FxHashMap<&'static str, Vec<Point>>,
 }
 
 // ── StrategyCtx ───────────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
-pub struct StrategyCtx {
+pub struct Strategy {
     pub account: Account,
 
     // Live orders: Pending or PartiallyFilled, keyed by order id
@@ -331,7 +326,7 @@ pub struct StrategyCtx {
     next_position_id: PositionId,
 }
 
-impl StrategyCtx {
+impl Strategy {
     pub fn new(account: Account, total_bars: usize) -> Self {
         let peak_equity = account.initial_capital();
         Self {
@@ -668,7 +663,7 @@ impl StrategyCtx {
     }
 }
 
-impl Default for StrategyCtx {
+impl Default for Strategy {
     fn default() -> Self {
         Self::new(Account::Spot(SpotAccount::new(100_000.0, 0.001, 0.0)), 0)
     }
