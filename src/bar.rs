@@ -1,3 +1,5 @@
+use chrono::{DateTime, Utc};
+
 /// ABI-stable bar passed across the DLL boundary.
 ///
 /// `timestamp_ms` is milliseconds since Unix epoch (UTC).
@@ -5,7 +7,7 @@
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Bar {
-    pub timestamp_ms: i64,
+    pub time: DateTime<Utc>,
     pub open: f32,
     pub high: f32,
     pub low: f32,
