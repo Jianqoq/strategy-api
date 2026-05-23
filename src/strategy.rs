@@ -31,7 +31,8 @@ pub struct StrategyInfo {
 pub type FnStrategyInfo = unsafe extern "C" fn() -> StrategyInfo;
 pub type FnOnInit = unsafe extern "C" fn(total_bars: usize);
 pub type FnOnBar = unsafe extern "C" fn(bar: *const Bar, index: usize, ctx: *mut Context);
-pub type FnOnFinish = unsafe extern "C" fn(ctx: *mut Context);
+pub type FnOnRestoreState = unsafe extern "C" fn(state: StateBlob);
+pub type FnOnFinish = unsafe extern "C" fn(ctx: *mut Context) -> StateBlob;
 
 // ── OnBar trait ────────────────────────────────────────────────────────────
 
