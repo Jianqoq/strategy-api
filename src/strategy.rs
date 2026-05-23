@@ -123,41 +123,41 @@ macro_rules! export_strategy {
             assert_strategy::<$ty>();
         };
 
-        static STRATEGY_INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$ty>> =
+        static INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$ty>> =
             ::std::sync::OnceLock::new();
 
-        fn get_strategy_instance() -> ::std::sync::MutexGuard<'static, $ty> {
-            STRATEGY_INSTANCE
+        fn get_instance() -> ::std::sync::MutexGuard<'static, $ty> {
+            INSTANCE
                 .get_or_init(|| ::std::sync::Mutex::new(<$ty as $crate::OnStrategy>::new()))
                 .lock()
                 .expect("strategy mutex poisoned")
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn strategy_on_init(total_bars: usize) {
-            <$ty as $crate::OnStrategy>::init(&mut *get_strategy_instance(), total_bars);
+        pub extern "C" fn on_init(total_bars: usize) {
+            <$ty as $crate::OnStrategy>::init(&mut *get_instance(), total_bars);
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn strategy_restore_state(state: $crate::StateBlob) {
-            <$ty as $crate::OnStrategy>::restore_state(&mut *get_strategy_instance(), state);
+        pub extern "C" fn restore_state(state: $crate::StateBlob) {
+            <$ty as $crate::OnStrategy>::restore_state(&mut *get_instance(), state);
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn strategy_on_bar(
+        pub extern "C" fn on_bar(
             bar: *const $crate::Bar,
             index: usize,
             ctx: *mut $crate::Strategy,
         ) {
             let bar = unsafe { &*bar };
             let ctx = unsafe { &mut *ctx };
-            <$ty as $crate::OnStrategy>::on_bar(&mut *get_strategy_instance(), bar, index, ctx)
+            <$ty as $crate::OnStrategy>::on_bar(&mut *get_instance(), bar, index, ctx)
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn strategy_on_finish(ctx: *mut $crate::Strategy) -> $crate::StateBlob {
+        pub extern "C" fn on_finish(ctx: *mut $crate::Strategy) -> $crate::StateBlob {
             let ctx = unsafe { &mut *ctx };
-            let state = <$ty as $crate::OnStrategy>::on_finish(&mut *get_strategy_instance(), ctx);
+            let state = <$ty as $crate::OnStrategy>::on_finish(&mut *get_instance(), ctx);
             let mut bytes = std::mem::ManuallyDrop::new(state);
             $crate::StateBlob {
                 ptr: bytes.as_mut_ptr(),
@@ -175,42 +175,42 @@ macro_rules! export_indicator {
             assert_indicator::<$ty>();
         };
 
-        static INDICATOR_INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$ty>> =
+        static INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$ty>> =
             ::std::sync::OnceLock::new();
 
-        fn get_indicator_instance() -> ::std::sync::MutexGuard<'static, $ty> {
-            INDICATOR_INSTANCE
+        fn get_instance() -> ::std::sync::MutexGuard<'static, $ty> {
+            INSTANCE
                 .get_or_init(|| ::std::sync::Mutex::new(<$ty as $crate::OnIndicator>::new()))
                 .lock()
                 .expect("indicator mutex poisoned")
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn indicator_on_init(total_bars: usize) {
-            <$ty as $crate::OnIndicator>::init(&mut *get_indicator_instance(), total_bars);
+        pub extern "C" fn on_init(total_bars: usize) {
+            <$ty as $crate::OnIndicator>::init(&mut *get_instance(), total_bars);
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn indicator_restore_state(state: $crate::StateBlob) {
-            <$ty as $crate::OnIndicator>::restore_state(&mut *get_indicator_instance(), state);
+        pub extern "C" fn restore_state(state: $crate::StateBlob) {
+            <$ty as $crate::OnIndicator>::restore_state(&mut *get_instance(), state);
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn indicator_on_bar(
+        pub extern "C" fn on_bar(
             bar: *const $crate::Bar,
             index: usize,
             ctx: *mut $crate::Indicator,
         ) {
             let bar = unsafe { &*bar };
             let ctx = unsafe { &mut *ctx };
-            <$ty as $crate::OnIndicator>::on_bar(&mut *get_indicator_instance(), bar, index, ctx)
+            <$ty as $crate::OnIndicator>::on_bar(&mut *get_instance(), bar, index, ctx)
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn indicator_on_finish(ctx: *mut $crate::Indicator) -> $crate::StateBlob {
+        pub extern "C" fn on_finish(ctx: *mut $crate::Indicator) -> $crate::StateBlob {
             let ctx = unsafe { &mut *ctx };
             let state =
-                <$ty as $crate::OnIndicator>::on_finish(&mut *get_indicator_instance(), ctx);
+                <$ty as $crate::OnIndicator>::on_finish(&mut *get_instance(), ctx);
             let mut bytes = std::mem::ManuallyDrop::new(state);
             $crate::StateBlob {
                 ptr: bytes.as_mut_ptr(),
