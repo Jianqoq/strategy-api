@@ -1,4 +1,7 @@
-use crate::{Bar, Strategy, indicator::Indicator};
+use crate::{Bar, indicator::Indicator};
+
+pub struct Strategy {
+}
 
 // ── Signal ────────────────────────────────────────────────────────────────────
 
