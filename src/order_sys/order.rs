@@ -1,3 +1,9 @@
+//! Order intent and order-state transitions.
+//!
+//! The [`Order`] aggregate models what the strategy or client asked the system
+//! to do. It tracks requested quantity, order type, time in force, fills
+//! applied so far, and terminal states such as cancel and reject.
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
@@ -5,13 +11,17 @@ use crate::order_sys::fill::Fill;
 use crate::order_sys::lot::LotSide;
 use crate::order_sys::{FillId, OrderId};
 
+/// Direction of the order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderSide {
+    /// Buy side order.
     Buy,
+    /// Sell side order.
     Sell,
 }
 
 impl OrderSide {
+    /// Maps an opening order side to the resulting lot side.
     pub fn to_open_lot_side(self) -> LotSide {
         match self {
             Self::Buy => LotSide::Long,
@@ -19,6 +29,7 @@ impl OrderSide {
         }
     }
 
+    /// Returns which lot side this order would close.
     pub fn closing_lot_side(self) -> LotSide {
         match self {
             Self::Buy => LotSide::Short,
@@ -27,84 +38,140 @@ impl OrderSide {
     }
 }
 
+/// Whether an order opens or closes exposure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PositionEffect {
+    /// The order adds new position exposure.
     Open,
+    /// The order reduces or removes existing position exposure.
     Close,
 }
 
+/// Execution style requested by the order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderType {
+    /// Immediate execution at the best available price.
     Market,
+    /// Execution limited by a limit price.
     Limit,
+    /// Triggered by a stop price and then behaves like a market order.
     Stop,
+    /// Triggered by a stop price and then behaves like a limit order.
     StopLimit,
 }
 
+/// Time-in-force policy requested by the order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeInForce {
+    /// Valid for the current trading day or session.
     Day,
+    /// Good until canceled.
     Gtc,
+    /// Immediate-or-cancel.
     Ioc,
+    /// Fill-or-kill.
     Fok,
 }
 
+/// Current lifecycle state of the order aggregate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderStatus {
+    /// The order has been created locally but not yet acknowledged.
     Pending,
+    /// The order is live and working in the market.
     Working,
+    /// The order has received at least one fill and still has leaves quantity.
     PartiallyFilled,
+    /// The order has been fully filled.
     Filled,
+    /// The order was canceled before completion.
     Canceled,
+    /// The order was rejected.
     Rejected,
 }
 
+/// Domain errors raised while validating or mutating an order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrderError {
+    /// The symbol string was empty or whitespace.
     EmptySymbol,
+    /// Requested quantity must be strictly positive.
     NonPositiveQuantity {
+        /// Invalid quantity supplied by the caller.
         quantity: Decimal,
     },
+    /// Prices must be strictly positive when present.
     NonPositivePrice {
+        /// Invalid price supplied by the caller.
         price: Decimal,
     },
+    /// A limit order requires a limit price.
     MissingLimitPrice,
+    /// A stop order requires a stop price.
     MissingStopPrice,
+    /// A limit price was supplied to an order type that does not use one.
     UnexpectedLimitPrice,
+    /// A stop price was supplied to an order type that does not use one.
     UnexpectedStopPrice,
+    /// Order events must be applied in non-decreasing timestamp order.
     EventOutOfOrder {
+        /// Timestamp already stored on the order.
         previous_timestamp: DateTime<Utc>,
+        /// Newly supplied timestamp.
         new_timestamp: DateTime<Utc>,
     },
+    /// The fill referenced a different order.
     FillOrderMismatch {
+        /// Order expected by the aggregate.
         expected: OrderId,
+        /// Order referenced by the fill.
         actual: OrderId,
     },
+    /// The fill symbol did not match the order symbol.
     FillSymbolMismatch {
+        /// Symbol stored on the order.
         expected: String,
+        /// Symbol stored on the fill.
         actual: String,
     },
+    /// The fill side did not match the order side.
     FillSideMismatch {
+        /// Side stored on the order.
         expected: OrderSide,
+        /// Side stored on the fill.
         actual: OrderSide,
     },
+    /// The fill position effect did not match the order position effect.
     FillPositionEffectMismatch {
+        /// Position effect stored on the order.
         expected: PositionEffect,
+        /// Position effect stored on the fill.
         actual: PositionEffect,
     },
+    /// The fill quantity exceeded the order's remaining leaves quantity.
     FillQuantityExceedsLeaves {
+        /// Quantity carried by the fill.
         fill_qty: Decimal,
+        /// Remaining quantity on the order.
         leaves_qty: Decimal,
     },
+    /// The same fill identifier was applied more than once.
     DuplicateFillId {
+        /// Duplicate fill identifier.
         fill_id: FillId,
     },
+    /// The order is already terminal and cannot accept more lifecycle events.
     TerminalStatus {
+        /// Terminal order identifier.
         order_id: OrderId,
+        /// Current terminal status.
         status: OrderStatus,
     },
+    /// A rejection after any fills would destroy audit consistency.
     RejectAfterFill {
+        /// Order being rejected.
         order_id: OrderId,
+        /// Already filled quantity on the order.
         filled_qty: Decimal,
     },
 }
@@ -185,30 +252,54 @@ impl std::fmt::Display for OrderError {
 
 impl std::error::Error for OrderError {}
 
+/// Order aggregate and state machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Order {
+    /// Stable order identifier.
     id: OrderId,
+    /// Instrument symbol requested by the order.
     symbol: String,
+    /// Buy or sell side.
     side: OrderSide,
+    /// Whether the order opens or closes exposure.
     position_effect: PositionEffect,
+    /// Execution style requested by the caller.
     order_type: OrderType,
+    /// Time-in-force policy.
     time_in_force: TimeInForce,
+    /// UTC timestamp when the order was submitted to the system.
     submitted_at: DateTime<Utc>,
+    /// Timestamp of the most recent lifecycle event.
     last_event_at: DateTime<Utc>,
+    /// Original requested quantity.
     requested_qty: Decimal,
+    /// Optional limit price depending on the order type.
     limit_price: Option<Decimal>,
+    /// Optional stop price depending on the order type.
     stop_price: Option<Decimal>,
+    /// Current order status.
     status: OrderStatus,
+    /// Cumulative filled quantity.
     filled_qty: Decimal,
+    /// Weighted average fill price, if any fills have occurred.
     average_fill_price: Option<Decimal>,
+    /// Cumulative fees charged by fills applied to the order.
     cumulative_fees: Decimal,
+    /// Fill identifiers already applied to the order.
     fill_ids: Vec<FillId>,
+    /// Cancellation timestamp when the order was canceled.
     canceled_at: Option<DateTime<Utc>>,
+    /// Rejection timestamp when the order was rejected.
     rejected_at: Option<DateTime<Utc>>,
+    /// Free-form reject reason.
     reject_reason: Option<String>,
 }
 
 impl Order {
+    /// Creates a new order aggregate in [`OrderStatus::Pending`].
+    ///
+    /// The constructor validates quantity and price requirements implied by the
+    /// [`OrderType`].
     pub fn new(
         id: OrderId,
         symbol: impl Into<String>,
@@ -251,86 +342,110 @@ impl Order {
         })
     }
 
+    /// Returns the order identifier.
     pub fn id(&self) -> OrderId {
         self.id
     }
 
+    /// Returns the order symbol.
     pub fn symbol(&self) -> &str {
         &self.symbol
     }
 
+    /// Returns the order side.
     pub fn side(&self) -> OrderSide {
         self.side
     }
 
+    /// Returns whether the order opens or closes exposure.
     pub fn position_effect(&self) -> PositionEffect {
         self.position_effect
     }
 
+    /// Returns the order type.
     pub fn order_type(&self) -> OrderType {
         self.order_type
     }
 
+    /// Returns the time-in-force policy.
     pub fn time_in_force(&self) -> TimeInForce {
         self.time_in_force
     }
 
+    /// Returns the submission timestamp.
     pub fn submitted_at(&self) -> DateTime<Utc> {
         self.submitted_at
     }
 
+    /// Returns the timestamp of the most recent lifecycle event.
     pub fn last_event_at(&self) -> DateTime<Utc> {
         self.last_event_at
     }
 
+    /// Returns the originally requested quantity.
     pub fn requested_qty(&self) -> Decimal {
         self.requested_qty
     }
 
+    /// Returns the limit price if the order type uses one.
     pub fn limit_price(&self) -> Option<Decimal> {
         self.limit_price
     }
 
+    /// Returns the stop price if the order type uses one.
     pub fn stop_price(&self) -> Option<Decimal> {
         self.stop_price
     }
 
+    /// Returns the current status.
     pub fn status(&self) -> OrderStatus {
         self.status
     }
 
+    /// Returns cumulative filled quantity.
     pub fn filled_qty(&self) -> Decimal {
         self.filled_qty
     }
 
+    /// Returns remaining quantity still open on the order.
     pub fn leaves_qty(&self) -> Decimal {
         self.requested_qty - self.filled_qty
     }
 
+    /// Returns weighted average fill price if at least one fill exists.
     pub fn average_fill_price(&self) -> Option<Decimal> {
         self.average_fill_price
     }
 
+    /// Returns cumulative fees charged by all fills.
     pub fn cumulative_fees(&self) -> Decimal {
         self.cumulative_fees
     }
 
+    /// Returns identifiers of fills already applied to the order.
     pub fn fill_ids(&self) -> &[FillId] {
         &self.fill_ids
     }
 
+    /// Returns cancellation timestamp when the order was canceled.
     pub fn canceled_at(&self) -> Option<DateTime<Utc>> {
         self.canceled_at
     }
 
+    /// Returns rejection timestamp when the order was rejected.
     pub fn rejected_at(&self) -> Option<DateTime<Utc>> {
         self.rejected_at
     }
 
+    /// Returns reject reason text when the order was rejected.
     pub fn reject_reason(&self) -> Option<&str> {
         self.reject_reason.as_deref()
     }
 
+    /// Marks the order as acknowledged and working.
+    ///
+    /// This transition is only legal while the order is non-terminal and the
+    /// event timestamp is not earlier than the previous event.
     pub fn acknowledge(&mut self, acknowledged_at: DateTime<Utc>) -> Result<(), OrderError> {
         self.ensure_non_terminal()?;
         ensure_event_order(self.last_event_at, acknowledged_at)?;
@@ -342,6 +457,11 @@ impl Order {
         Ok(())
     }
 
+    /// Applies one immutable fill to the order aggregate.
+    ///
+    /// The method validates fill identity, symbol, side, position effect,
+    /// duplicate replay, chronological ordering, and leaves quantity before
+    /// mutating the aggregate.
     pub fn record_fill(&mut self, fill: &Fill) -> Result<(), OrderError> {
         self.ensure_non_terminal()?;
         if fill.order_id() != self.id {
@@ -398,6 +518,9 @@ impl Order {
         Ok(())
     }
 
+    /// Cancels the order.
+    ///
+    /// Cancellation is only legal while the order is non-terminal.
     pub fn cancel(&mut self, canceled_at: DateTime<Utc>) -> Result<(), OrderError> {
         self.ensure_non_terminal()?;
         ensure_event_order(self.last_event_at, canceled_at)?;
@@ -408,6 +531,10 @@ impl Order {
         Ok(())
     }
 
+    /// Rejects the order with a free-form reason.
+    ///
+    /// Rejections are blocked after any fills to avoid creating contradictory
+    /// audit history.
     pub fn reject(
         &mut self,
         rejected_at: DateTime<Utc>,
@@ -429,6 +556,7 @@ impl Order {
         Ok(())
     }
 
+    /// Internal helper that rejects transitions out of terminal states.
     fn ensure_non_terminal(&self) -> Result<(), OrderError> {
         match self.status {
             OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected => {
@@ -442,6 +570,7 @@ impl Order {
     }
 }
 
+/// Validates that quantity is strictly positive.
 fn validate_positive_quantity(quantity: Decimal) -> Result<(), OrderError> {
     if quantity <= Decimal::ZERO {
         return Err(OrderError::NonPositiveQuantity { quantity });
@@ -450,6 +579,7 @@ fn validate_positive_quantity(quantity: Decimal) -> Result<(), OrderError> {
     Ok(())
 }
 
+/// Validates that price is strictly positive.
 fn validate_positive_price(price: Decimal) -> Result<(), OrderError> {
     if price <= Decimal::ZERO {
         return Err(OrderError::NonPositivePrice { price });
@@ -458,6 +588,7 @@ fn validate_positive_price(price: Decimal) -> Result<(), OrderError> {
     Ok(())
 }
 
+/// Validates limit and stop price requirements implied by the order type.
 fn validate_price_requirements(
     order_type: OrderType,
     limit_price: Option<Decimal>,
@@ -508,6 +639,7 @@ fn validate_price_requirements(
     Ok(())
 }
 
+/// Validates chronological ordering for order lifecycle events.
 fn ensure_event_order(
     previous_timestamp: DateTime<Utc>,
     new_timestamp: DateTime<Utc>,

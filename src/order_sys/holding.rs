@@ -1,3 +1,22 @@
+//! Per-symbol position aggregate and lot-relief engine.
+//!
+//! A [`Holding`] owns every open and closed [`Lot`](crate::order_sys::lot::Lot)
+//! for one symbol. It is responsible for:
+//!
+//! - preventing mixed long/short exposure inside the same aggregate,
+//! - translating fills into opened lots,
+//! - selecting which lots to close when a closing fill arrives,
+//! - preserving an auditable close trail across many lots.
+//!
+//! The lot-relief selection is modeled as a two-step process:
+//!
+//! 1. Build a close plan that decides which lot quantities should be consumed.
+//! 2. Apply that plan to the lots and record realized audit events.
+//!
+//! This separation keeps the matching logic testable and allows advanced
+//! methods such as `SpecificLot` and `AverageCost` without duplicating close
+//! execution logic.
+
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
@@ -8,59 +27,106 @@ use crate::order_sys::lot::{Lot, LotClose, LotError, LotSide};
 use crate::order_sys::order::{OrderSide, PositionEffect};
 use crate::order_sys::{FillId, HoldingId, LotId, OrderId};
 
+/// Policy that decides which open lots should be relieved first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LotReliefMethod {
+    /// Oldest open lots first.
     Fifo,
+    /// Newest open lots first.
     Lifo,
+    /// Highest fee-adjusted cost basis first.
     Hifo,
+    /// Lots with the worst estimated unit net PnL first.
     MaxLoss,
+    /// Lots with the best estimated unit net PnL first.
     MaxGain,
+    /// Follow the caller-provided lot order exactly.
+    ///
+    /// The list contains lot identifiers, not quantities. The engine consumes
+    /// each selected lot in list order until the requested close quantity is
+    /// satisfied or the selection runs out.
     SpecificLot(Vec<LotId>),
+    /// Pro-rate the close quantity across all currently open lots.
+    ///
+    /// This implementation preserves lot-level auditability by allocating the
+    /// close across existing lots rather than collapsing them into a single
+    /// pooled position.
     AverageCost,
 }
 
+/// Errors raised while mutating a holding or building a close plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HoldingError {
+    /// The symbol string was empty or whitespace.
     EmptySymbol,
+    /// A fill referenced a different symbol from the holding.
     SymbolMismatch {
+        /// Symbol stored on the holding.
         expected: String,
+        /// Symbol carried by the incoming fill.
         actual: String,
     },
+    /// The caller attempted to mix long and short lots in one holding.
     MixedLotSide {
+        /// Side already present in open lots.
         expected: LotSide,
+        /// Side requested by the new lot.
         actual: LotSide,
     },
+    /// The caller used a fill with the wrong position effect for the operation.
     PositionEffectMismatch {
+        /// Position effect expected by the holding operation.
         expected: PositionEffect,
+        /// Position effect carried by the fill.
         actual: PositionEffect,
     },
+    /// The fill side cannot close the currently open lot side.
     CloseSideMismatch {
+        /// Side of the currently open exposure.
         holding_side: LotSide,
+        /// Side of the closing fill.
         fill_side: OrderSide,
     },
+    /// A close was requested while the holding had no open lots.
     NoOpenLots {
+        /// Symbol of the holding.
         symbol: String,
     },
+    /// Requested close quantity exceeded total open quantity.
     CloseExceedsOpenQuantity {
+        /// Quantity requested by the close fill.
         requested: Decimal,
+        /// Quantity currently open across all lots.
         available: Decimal,
     },
+    /// The same fill was replayed into the holding twice.
     DuplicateFillId {
+        /// Identifier of the duplicate fill.
         fill_id: FillId,
     },
+    /// A `SpecificLot` selection referenced a lot that does not exist here.
     UnknownLotId {
+        /// Unknown lot identifier.
         lot_id: LotId,
     },
+    /// A `SpecificLot` selection referenced a lot that is already closed.
     LotNotOpen {
+        /// Lot identifier that is not currently open.
         lot_id: LotId,
     },
+    /// A `SpecificLot` selection listed the same lot more than once.
     DuplicateLotIdSelection {
+        /// Duplicate lot identifier.
         lot_id: LotId,
     },
+    /// The selected lots in `SpecificLot` did not cover the requested close.
     SpecificLotQuantityInsufficient {
+        /// Quantity requested by the close fill.
         requested: Decimal,
+        /// Aggregate quantity covered by the provided lot list.
         available: Decimal,
     },
+    /// Wrapped error bubbled up from an individual lot.
     Lot(LotError),
 }
 
@@ -142,42 +208,66 @@ impl From<LotError> for HoldingError {
     }
 }
 
+/// One realized lot match produced by a holding-level close operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HoldingCloseMatch {
+    /// Lot relieved by this match.
     pub lot_id: LotId,
+    /// Side of the relieved lot.
     pub lot_side: LotSide,
+    /// Concrete lot-level close event produced by the match.
     pub close: LotClose,
 }
 
+/// Full result of applying one close fill to a holding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HoldingClose {
+    /// Symbol of the holding.
     pub symbol: String,
+    /// Closing order identifier.
     pub close_order_id: OrderId,
+    /// Closing fill identifier.
     pub close_fill_id: FillId,
+    /// Total quantity closed by the fill.
     pub closed_qty: Decimal,
+    /// Execution price used for the entire close fill.
     pub close_price: Decimal,
+    /// Total fees on the close fill before per-lot allocation.
     pub close_fees: Decimal,
+    /// Per-lot matches created by this close.
     pub matches: Vec<HoldingCloseMatch>,
+    /// Sum of gross realized PnL across every match.
     pub total_realized_gross_pnl: Decimal,
+    /// Sum of net realized PnL across every match.
     pub total_realized_net_pnl: Decimal,
+    /// Remaining open quantity after the close completed.
     pub remaining_open_qty: Decimal,
 }
 
+/// Per-symbol aggregate that owns all lots.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Holding {
+    /// Stable identifier of the holding.
     id: HoldingId,
+    /// Instrument symbol represented by the holding.
     symbol: String,
+    /// Default lot-relief method used by [`Self::close_with_fill`].
     lot_relief_method: LotReliefMethod,
+    /// Complete set of lots, including closed historical lots.
     lots: Vec<Lot>,
 }
 
+/// Internal plan entry used to separate lot selection from lot mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ClosePlanEntry {
+    /// Index of the target lot inside `Holding::lots`.
     lot_index: usize,
+    /// Quantity that should be relieved from that lot.
     qty: Decimal,
 }
 
 impl Holding {
+    /// Creates a new empty holding for one symbol.
     pub fn new(
         id: HoldingId,
         symbol: impl Into<String>,
@@ -196,62 +286,78 @@ impl Holding {
         })
     }
 
+    /// Returns the holding identifier.
     pub fn id(&self) -> HoldingId {
         self.id
     }
 
+    /// Returns the symbol represented by the holding.
     pub fn symbol(&self) -> &str {
         &self.symbol
     }
 
+    /// Returns the default lot-relief method.
     pub fn lot_relief_method(&self) -> &LotReliefMethod {
         &self.lot_relief_method
     }
 
+    /// Replaces the default lot-relief method used by [`Self::close_with_fill`].
     pub fn set_lot_relief_method(&mut self, lot_relief_method: LotReliefMethod) {
         self.lot_relief_method = lot_relief_method;
     }
 
+    /// Returns all lots, including already closed historical lots.
     pub fn lots(&self) -> &[Lot] {
         &self.lots
     }
 
+    /// Returns the side of the currently open exposure, if any.
     pub fn side(&self) -> Option<LotSide> {
         self.lots.iter().find(|lot| lot.is_open()).map(Lot::side)
     }
 
+    /// Returns the total open quantity across all open lots.
     pub fn open_qty(&self) -> Decimal {
         self.lots
             .iter()
             .fold(Decimal::ZERO, |sum, lot| sum + lot.remaining_qty())
     }
 
+    /// Returns the total historically closed quantity across all lots.
     pub fn closed_qty(&self) -> Decimal {
         self.lots
             .iter()
             .fold(Decimal::ZERO, |sum, lot| sum + lot.closed_qty())
     }
 
+    /// Returns the number of lots that still have open quantity.
     pub fn open_lot_count(&self) -> usize {
         self.lots.iter().filter(|lot| lot.is_open()).count()
     }
 
+    /// Returns `true` when the holding has no open quantity.
     pub fn is_flat(&self) -> bool {
         self.open_qty().is_zero()
     }
 
+    /// Returns cumulative realized gross PnL across all lots.
     pub fn realized_gross_pnl(&self) -> Decimal {
         self.lots
             .iter()
             .fold(Decimal::ZERO, |sum, lot| sum + lot.realized_gross_pnl())
     }
 
+    /// Returns cumulative realized net PnL across all lots.
     pub fn realized_net_pnl(&self) -> Decimal {
         self.lots
             .iter()
             .fold(Decimal::ZERO, |sum, lot| sum + lot.realized_net_pnl())
     }
 
+    /// Inserts a pre-built lot into the holding.
+    ///
+    /// The holding forbids mixed long and short exposure. Closed historical lots
+    /// do not determine side; only currently open lots do.
     pub fn open_lot(&mut self, lot: Lot) -> Result<&Lot, HoldingError> {
         if let Some(existing_side) = self.side()
             && existing_side != lot.side()
@@ -269,6 +375,7 @@ impl Holding {
             .expect("holding must contain the lot that was just pushed"))
     }
 
+    /// Converts one opening fill into a new lot and appends it to the holding.
     pub fn open_lot_from_fill(&mut self, lot_id: LotId, fill: &Fill) -> Result<&Lot, HoldingError> {
         self.ensure_symbol_matches(fill.symbol())?;
         self.ensure_fill_not_applied(fill.id())?;
@@ -293,11 +400,16 @@ impl Holding {
         self.open_lot(lot)
     }
 
+    /// Closes quantity using the holding's default lot-relief method.
     pub fn close_with_fill(&mut self, fill: &Fill) -> Result<HoldingClose, HoldingError> {
         let close_plan = self.build_close_plan(fill, &self.lot_relief_method)?;
         self.execute_close_plan(fill, close_plan)
     }
 
+    /// Closes quantity using a method supplied for this call only.
+    ///
+    /// This is especially useful for one-off `SpecificLot` or `AverageCost`
+    /// operations without changing the holding's default policy.
     pub fn close_with_fill_using(
         &mut self,
         fill: &Fill,
@@ -307,6 +419,11 @@ impl Holding {
         self.execute_close_plan(fill, close_plan)
     }
 
+    /// Applies a previously computed close plan to the underlying lots.
+    ///
+    /// The plan contains only lot indices and quantities. This method handles
+    /// close-fee allocation, lot mutation, and the final holding-level
+    /// aggregation of realized PnL.
     fn execute_close_plan(
         &mut self,
         fill: &Fill,
@@ -368,6 +485,10 @@ impl Holding {
         })
     }
 
+    /// Builds a close plan without mutating any lots.
+    ///
+    /// This method validates fill identity and close preconditions first, then
+    /// delegates to the selected lot-relief strategy.
     fn build_close_plan(
         &self,
         fill: &Fill,
@@ -434,6 +555,7 @@ impl Holding {
         }
     }
 
+    /// Validates that an incoming symbol belongs to this holding.
     fn ensure_symbol_matches(&self, symbol: &str) -> Result<(), HoldingError> {
         if self.symbol != symbol {
             return Err(HoldingError::SymbolMismatch {
@@ -445,6 +567,7 @@ impl Holding {
         Ok(())
     }
 
+    /// Rejects duplicate open or close fill replays.
     fn ensure_fill_not_applied(&self, fill_id: FillId) -> Result<(), HoldingError> {
         if self.lots.iter().any(|lot| {
             lot.open_fill_id() == fill_id
@@ -459,6 +582,7 @@ impl Holding {
         Ok(())
     }
 
+    /// Returns indices of lots that still have open quantity.
     fn open_lot_indices(&self) -> Vec<usize> {
         self.lots
             .iter()
@@ -467,6 +591,10 @@ impl Holding {
             .collect()
     }
 
+    /// Builds a simple sequential close plan from a pre-ordered lot list.
+    ///
+    /// This helper is used by FIFO, LIFO, HIFO, MaxLoss, and MaxGain after they
+    /// decide the lot ordering.
     fn build_sequential_plan(
         &self,
         ordered_indices: Vec<usize>,
@@ -500,6 +628,10 @@ impl Holding {
         close_plan
     }
 
+    /// Builds an `AverageCost` plan by allocating close quantity pro rata.
+    ///
+    /// The implementation preserves auditability by still mutating concrete lots.
+    /// It does not collapse lots into a single pooled average-cost position.
     fn build_average_cost_plan(
         &self,
         ordered_indices: Vec<usize>,
@@ -541,6 +673,7 @@ impl Holding {
         close_plan
     }
 
+    /// Builds a plan that follows an explicit lot-id selection from the caller.
     fn build_specific_lot_plan(
         &self,
         lot_ids: &[LotId],
@@ -593,12 +726,21 @@ impl Holding {
         Ok(close_plan)
     }
 
+    /// Comparator used by `Hifo`.
+    ///
+    /// The method sorts by fee-adjusted open basis descending, then uses open
+    /// timestamp and lot id as deterministic tie-breakers.
     fn compare_hifo(&self, left_index: usize, right_index: usize) -> Ordering {
         self.fee_adjusted_open_basis(&self.lots[right_index])
             .cmp(&self.fee_adjusted_open_basis(&self.lots[left_index]))
             .then_with(|| self.lot_order_tiebreak(left_index, right_index))
     }
 
+    /// Comparator used by `MaxLoss` and `MaxGain`.
+    ///
+    /// The estimated unit net PnL incorporates close price and remaining
+    /// unrecognized open fees. Sorting ascending yields `MaxLoss`; reversing the
+    /// argument order yields `MaxGain`.
     fn compare_estimated_pnl(
         &self,
         left_index: usize,
@@ -610,6 +752,7 @@ impl Holding {
             .then_with(|| self.lot_order_tiebreak(left_index, right_index))
     }
 
+    /// Stable tie-breaker used after strategy-specific comparisons.
     fn lot_order_tiebreak(&self, left_index: usize, right_index: usize) -> Ordering {
         self.lots[left_index]
             .opened_at()
@@ -617,10 +760,15 @@ impl Holding {
             .then_with(|| self.lots[left_index].id().cmp(&self.lots[right_index].id()))
     }
 
+    /// Returns fee-adjusted open basis per unit for one lot.
     fn fee_adjusted_open_basis(&self, lot: &Lot) -> Decimal {
         lot.open_price() + self.remaining_open_fees(lot) / lot.remaining_qty()
     }
 
+    /// Estimates unit net PnL at a hypothetical close price.
+    ///
+    /// This helper is used only for ordering lots during selection. Actual
+    /// realized PnL is still computed by [`Lot::close`](crate::order_sys::lot::Lot::close).
     fn estimated_unit_net_pnl(&self, lot: &Lot, close_price: Decimal) -> Decimal {
         let gross_unit_pnl = match lot.side() {
             LotSide::Long => close_price - lot.open_price(),
@@ -629,6 +777,7 @@ impl Holding {
         gross_unit_pnl - self.remaining_open_fees(lot) / lot.remaining_qty()
     }
 
+    /// Returns open-side fees that have not yet been realized.
     fn remaining_open_fees(&self, lot: &Lot) -> Decimal {
         lot.open_fees() - lot.realized_open_fees()
     }

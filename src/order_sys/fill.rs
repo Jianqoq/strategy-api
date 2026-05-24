@@ -1,22 +1,46 @@
+//! Immutable execution facts.
+//!
+//! A [`Fill`] represents what actually happened in the market or simulator.
+//! Unlike [`crate::order_sys::order::Order`], which models intent and state
+//! transitions, a fill is an immutable record of one executed slice.
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
 use crate::order_sys::order::{OrderSide, PositionEffect};
 use crate::order_sys::{FillId, OrderId};
 
+/// Whether the fill provided or removed liquidity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FillLiquidity {
+    /// The fill added liquidity to the venue book.
     Maker,
+    /// The fill removed liquidity from the venue book.
     Taker,
+    /// Liquidity side is unknown or was not reported.
     Unknown,
 }
 
+/// Domain errors raised while constructing a fill.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FillError {
+    /// The symbol string was empty or whitespace.
     EmptySymbol,
-    NonPositiveQuantity { quantity: Decimal },
-    NonPositivePrice { price: Decimal },
-    NegativeFees { fees: Decimal },
+    /// The executed quantity must be strictly positive.
+    NonPositiveQuantity {
+        /// The invalid quantity supplied by the caller.
+        quantity: Decimal,
+    },
+    /// The execution price must be strictly positive.
+    NonPositivePrice {
+        /// The invalid price supplied by the caller.
+        price: Decimal,
+    },
+    /// Fees must not be negative.
+    NegativeFees {
+        /// The invalid fee amount supplied by the caller.
+        fees: Decimal,
+    },
 }
 
 impl std::fmt::Display for FillError {
@@ -38,23 +62,40 @@ impl std::fmt::Display for FillError {
 
 impl std::error::Error for FillError {}
 
+/// Immutable record of one execution slice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fill {
+    /// Unique identifier of the fill.
     id: FillId,
+    /// Order that this fill belongs to.
     order_id: OrderId,
+    /// Instrument symbol, for example `AAPL`.
     symbol: String,
+    /// Side of the parent order.
     order_side: OrderSide,
+    /// Whether this fill opens or closes position exposure.
     position_effect: PositionEffect,
+    /// UTC execution timestamp.
     executed_at: DateTime<Utc>,
+    /// Executed quantity.
     qty: Decimal,
+    /// Execution price.
     price: Decimal,
+    /// Fees charged for this execution slice.
     fees: Decimal,
+    /// Whether the fill provided or removed liquidity.
     liquidity: FillLiquidity,
+    /// Venue-native execution identifier, if one exists.
     venue_execution_id: Option<String>,
+    /// Venue-native order identifier, if one exists.
     venue_order_id: Option<String>,
 }
 
 impl Fill {
+    /// Creates a fill with default metadata.
+    ///
+    /// This constructor is convenient when venue identifiers and liquidity side
+    /// are not available.
     pub fn new(
         id: FillId,
         order_id: OrderId,
@@ -82,6 +123,10 @@ impl Fill {
         )
     }
 
+    /// Creates a fill with full optional venue metadata.
+    ///
+    /// The constructor validates the symbol, quantity, price, and fee values so
+    /// downstream consumers can treat a `Fill` as a fully trusted immutable fact.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_metadata(
         id: FillId,
@@ -127,54 +172,67 @@ impl Fill {
         })
     }
 
+    /// Returns the fill identifier.
     pub fn id(&self) -> FillId {
         self.id
     }
 
+    /// Returns the parent order identifier.
     pub fn order_id(&self) -> OrderId {
         self.order_id
     }
 
+    /// Returns the instrument symbol.
     pub fn symbol(&self) -> &str {
         &self.symbol
     }
 
+    /// Returns the side of the parent order.
     pub fn order_side(&self) -> OrderSide {
         self.order_side
     }
 
+    /// Returns whether the fill opens or closes exposure.
     pub fn position_effect(&self) -> PositionEffect {
         self.position_effect
     }
 
+    /// Returns the execution timestamp.
     pub fn executed_at(&self) -> DateTime<Utc> {
         self.executed_at
     }
 
+    /// Returns the executed quantity.
     pub fn qty(&self) -> Decimal {
         self.qty
     }
 
+    /// Returns the execution price.
     pub fn price(&self) -> Decimal {
         self.price
     }
 
+    /// Returns the execution fees.
     pub fn fees(&self) -> Decimal {
         self.fees
     }
 
+    /// Returns gross executed notional, equal to `qty * price`.
     pub fn gross_notional(&self) -> Decimal {
         self.qty * self.price
     }
 
+    /// Returns the liquidity side if one was recorded.
     pub fn liquidity(&self) -> FillLiquidity {
         self.liquidity
     }
 
+    /// Returns the venue execution identifier, if any.
     pub fn venue_execution_id(&self) -> Option<&str> {
         self.venue_execution_id.as_deref()
     }
 
+    /// Returns the venue order identifier, if any.
     pub fn venue_order_id(&self) -> Option<&str> {
         self.venue_order_id.as_deref()
     }

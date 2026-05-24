@@ -1,40 +1,68 @@
+//! Tax-lot model with full close-history auditing.
+//!
+//! A [`Lot`] represents one position fragment created by a single opening fill.
+//! The lot keeps immutable open metadata and records every partial close in
+//! [`LotClose`] so realized PnL can be reconstructed later without relying on
+//! external logs.
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
 use crate::order_sys::{FillId, LotId, OrderId};
 
+/// Economic direction of the lot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LotSide {
+    /// A long lot profits when the close price is above the open price.
     Long,
+    /// A short lot profits when the close price is below the open price.
     Short,
 }
 
+/// Current lifecycle state of a lot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LotStatus {
+    /// The lot still has remaining open quantity.
     Open,
+    /// The lot has been fully closed.
     Closed,
 }
 
+/// Domain errors raised while creating or closing a lot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LotError {
+    /// The supplied quantity was zero or negative.
     NonPositiveQuantity {
+        /// The invalid quantity value supplied by the caller.
         quantity: Decimal,
     },
+    /// The supplied price was zero or negative.
     NonPositivePrice {
+        /// The invalid price value supplied by the caller.
         price: Decimal,
     },
+    /// Fees must not be negative.
     NegativeFees {
+        /// The invalid fee amount supplied by the caller.
         fees: Decimal,
     },
+    /// A close request attempted to close more than the remaining lot quantity.
     CloseExceedsRemaining {
+        /// The quantity requested by the caller.
         requested: Decimal,
+        /// The quantity still open on the lot.
         remaining: Decimal,
     },
+    /// Audit events must be applied in non-decreasing timestamp order.
     EventOutOfOrder {
+        /// The most recent timestamp already stored on the lot.
         previous_timestamp: DateTime<Utc>,
+        /// The newly requested event timestamp.
         new_timestamp: DateTime<Utc>,
     },
+    /// A fully closed lot cannot be closed again.
     LotAlreadyClosed {
+        /// The identifier of the already closed lot.
         lot_id: LotId,
     },
 }
@@ -74,45 +102,87 @@ impl std::fmt::Display for LotError {
 
 impl std::error::Error for LotError {}
 
+/// One realized-close event applied to a lot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LotClose {
+    /// Monotonic sequence number within the lot's close history.
     pub sequence: u32,
+    /// Closing order that produced this realized event.
     pub close_order_id: OrderId,
+    /// Closing fill that produced this realized event.
     pub close_fill_id: FillId,
+    /// UTC timestamp when the close fill executed.
     pub closed_at: DateTime<Utc>,
+    /// Quantity closed by this event.
     pub qty: Decimal,
+    /// Execution price of the close fill.
     pub price: Decimal,
+    /// Gross close notional, equal to `qty * price`.
     pub gross_notional: Decimal,
+    /// Fees directly attributed to the close fill itself.
     pub close_fees: Decimal,
+    /// Portion of open-side fees allocated to this close event.
     pub allocated_open_fees: Decimal,
+    /// Total fees realized by this event.
     pub total_fees: Decimal,
+    /// Gross realized PnL before fees for this event.
     pub realized_gross_pnl: Decimal,
+    /// Net realized PnL after open and close fees for this event.
     pub realized_net_pnl: Decimal,
+    /// Quantity still open after applying this close event.
     pub remaining_qty_after: Decimal,
 }
 
+/// Audit-friendly tax lot created by one opening fill.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lot {
+    /// Stable identifier of the lot within the order system.
     id: LotId,
+    /// Economic direction of the lot.
     side: LotSide,
+    /// UTC timestamp of the opening fill.
     opened_at: DateTime<Utc>,
+    /// Timestamp of the most recent audit event applied to the lot.
     updated_at: DateTime<Utc>,
+    /// Timestamp when the lot became fully closed, if any.
     closed_at: Option<DateTime<Utc>>,
+    /// Opening order that created the lot.
     open_order_id: OrderId,
+    /// Opening fill that created the lot.
     open_fill_id: FillId,
+    /// Original quantity opened by the lot.
     original_qty: Decimal,
+    /// Quantity that remains open.
     remaining_qty: Decimal,
+    /// Opening execution price.
     open_price: Decimal,
+    /// Total fees paid on the opening fill.
     open_fees: Decimal,
+    /// Gross opening notional, equal to `original_qty * open_price`.
     open_gross_notional: Decimal,
+    /// Full history of partial and final close events.
     close_events: Vec<LotClose>,
+    /// Cumulative realized gross PnL across all closes.
     realized_gross_pnl: Decimal,
+    /// Portion of open-side fees already realized.
     realized_open_fees: Decimal,
+    /// Cumulative close-side fees already realized.
     realized_close_fees: Decimal,
+    /// Cumulative realized net PnL across all closes.
     realized_net_pnl: Decimal,
 }
 
 impl Lot {
+    /// Creates a new lot from one opening fill.
+    ///
+    /// # Invariants
+    ///
+    /// - `original_qty` must be positive.
+    /// - `open_price` must be positive.
+    /// - `open_fees` must be non-negative.
+    ///
+    /// The new lot starts with `remaining_qty == original_qty` and no close
+    /// events.
     pub fn open(
         id: LotId,
         side: LotSide,
@@ -148,6 +218,14 @@ impl Lot {
         })
     }
 
+    /// Applies one partial or full close event to the lot.
+    ///
+    /// Open-side fees are prorated to the closed quantity. When the close
+    /// consumes the remaining quantity exactly, the method allocates the entire
+    /// residual open-fee balance to avoid fee leakage due to rounding.
+    ///
+    /// The returned [`LotClose`] reference points to the event stored inside the
+    /// lot's internal audit history.
     pub fn close(
         &mut self,
         close_order_id: OrderId,
@@ -227,14 +305,17 @@ impl Lot {
             .expect("close event was pushed before returning"))
     }
 
+    /// Returns the lot identifier.
     pub fn id(&self) -> LotId {
         self.id
     }
 
+    /// Returns the lot side.
     pub fn side(&self) -> LotSide {
         self.side
     }
 
+    /// Returns the derived lot status from the remaining quantity.
     pub fn status(&self) -> LotStatus {
         if self.is_closed() {
             LotStatus::Closed
@@ -243,83 +324,103 @@ impl Lot {
         }
     }
 
+    /// Returns `true` when the lot still has open quantity.
     pub fn is_open(&self) -> bool {
         !self.is_closed()
     }
 
+    /// Returns `true` when the lot has no remaining quantity.
     pub fn is_closed(&self) -> bool {
         self.remaining_qty.is_zero()
     }
 
+    /// Returns the opening timestamp of the lot.
     pub fn opened_at(&self) -> DateTime<Utc> {
         self.opened_at
     }
 
+    /// Returns the timestamp of the most recent audit event.
     pub fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
     }
 
+    /// Returns the final close timestamp when the lot is fully closed.
     pub fn closed_at(&self) -> Option<DateTime<Utc>> {
         self.closed_at
     }
 
+    /// Returns the order that opened the lot.
     pub fn open_order_id(&self) -> OrderId {
         self.open_order_id
     }
 
+    /// Returns the fill that opened the lot.
     pub fn open_fill_id(&self) -> FillId {
         self.open_fill_id
     }
 
+    /// Returns the original opened quantity.
     pub fn original_qty(&self) -> Decimal {
         self.original_qty
     }
 
+    /// Returns the total quantity already closed.
     pub fn closed_qty(&self) -> Decimal {
         self.original_qty - self.remaining_qty
     }
 
+    /// Returns the quantity that remains open.
     pub fn remaining_qty(&self) -> Decimal {
         self.remaining_qty
     }
 
+    /// Returns the opening execution price.
     pub fn open_price(&self) -> Decimal {
         self.open_price
     }
 
+    /// Returns the total opening fees recorded on the lot.
     pub fn open_fees(&self) -> Decimal {
         self.open_fees
     }
 
+    /// Returns the gross opening notional.
     pub fn open_gross_notional(&self) -> Decimal {
         self.open_gross_notional
     }
 
+    /// Returns the immutable list of close events in audit order.
     pub fn close_events(&self) -> &[LotClose] {
         &self.close_events
     }
 
+    /// Returns cumulative realized gross PnL across all close events.
     pub fn realized_gross_pnl(&self) -> Decimal {
         self.realized_gross_pnl
     }
 
+    /// Returns the portion of open fees already realized.
     pub fn realized_open_fees(&self) -> Decimal {
         self.realized_open_fees
     }
 
+    /// Returns cumulative close-side fees already realized.
     pub fn realized_close_fees(&self) -> Decimal {
         self.realized_close_fees
     }
 
+    /// Returns the sum of realized open and close fees.
     pub fn realized_total_fees(&self) -> Decimal {
         self.realized_open_fees + self.realized_close_fees
     }
 
+    /// Returns cumulative realized net PnL across all close events.
     pub fn realized_net_pnl(&self) -> Decimal {
         self.realized_net_pnl
     }
 }
 
+/// Validates that a quantity is strictly positive.
 fn validate_positive_quantity(quantity: Decimal) -> Result<(), LotError> {
     if quantity <= Decimal::ZERO {
         return Err(LotError::NonPositiveQuantity { quantity });
@@ -328,6 +429,7 @@ fn validate_positive_quantity(quantity: Decimal) -> Result<(), LotError> {
     Ok(())
 }
 
+/// Validates that a price is strictly positive.
 fn validate_positive_price(price: Decimal) -> Result<(), LotError> {
     if price <= Decimal::ZERO {
         return Err(LotError::NonPositivePrice { price });
@@ -336,6 +438,7 @@ fn validate_positive_price(price: Decimal) -> Result<(), LotError> {
     Ok(())
 }
 
+/// Validates that fees are non-negative.
 fn validate_non_negative_fees(fees: Decimal) -> Result<(), LotError> {
     if fees < Decimal::ZERO {
         return Err(LotError::NegativeFees { fees });
