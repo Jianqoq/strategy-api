@@ -96,6 +96,9 @@ pub enum OrderError {
         fill_qty: Decimal,
         leaves_qty: Decimal,
     },
+    DuplicateFillId {
+        fill_id: FillId,
+    },
     TerminalStatus {
         order_id: OrderId,
         status: OrderStatus,
@@ -155,6 +158,13 @@ impl std::fmt::Display for OrderError {
                 f,
                 "fill quantity {fill_qty} exceeds order leaves quantity {leaves_qty}"
             ),
+            Self::DuplicateFillId { fill_id } => {
+                write!(
+                    f,
+                    "fill {} was already applied to this order",
+                    fill_id.value()
+                )
+            }
             Self::TerminalStatus { order_id, status } => write!(
                 f,
                 "order {} is in terminal status {:?}",
@@ -334,7 +344,6 @@ impl Order {
 
     pub fn record_fill(&mut self, fill: &Fill) -> Result<(), OrderError> {
         self.ensure_non_terminal()?;
-        ensure_event_order(self.last_event_at, fill.executed_at())?;
         if fill.order_id() != self.id {
             return Err(OrderError::FillOrderMismatch {
                 expected: self.id,
@@ -359,6 +368,10 @@ impl Order {
                 actual: fill.position_effect(),
             });
         }
+        if self.fill_ids.contains(&fill.id()) {
+            return Err(OrderError::DuplicateFillId { fill_id: fill.id() });
+        }
+        ensure_event_order(self.last_event_at, fill.executed_at())?;
         if fill.qty() > self.leaves_qty() {
             return Err(OrderError::FillQuantityExceedsLeaves {
                 fill_qty: fill.qty(),
@@ -661,6 +674,45 @@ mod tests {
             OrderError::RejectAfterFill {
                 order_id: OrderId::new(3),
                 filled_qty: dec(1, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn order_rejects_duplicate_fill_replay() {
+        let mut order = Order::new(
+            OrderId::new(4),
+            "AAPL",
+            OrderSide::Buy,
+            PositionEffect::Open,
+            OrderType::Market,
+            TimeInForce::Day,
+            ts(24),
+            dec(3, 0),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let fill = Fill::new(
+            FillId::new(14),
+            OrderId::new(4),
+            "AAPL",
+            OrderSide::Buy,
+            PositionEffect::Open,
+            ts(25),
+            dec(1, 0),
+            dec(100, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+
+        order.record_fill(&fill).unwrap();
+        let err = order.record_fill(&fill).unwrap_err();
+        assert_eq!(
+            err,
+            OrderError::DuplicateFillId {
+                fill_id: FillId::new(14),
             }
         );
     }

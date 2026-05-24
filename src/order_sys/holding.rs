@@ -37,6 +37,9 @@ pub enum HoldingError {
         requested: Decimal,
         available: Decimal,
     },
+    DuplicateFillId {
+        fill_id: FillId,
+    },
     Lot(LotError),
 }
 
@@ -78,6 +81,13 @@ impl std::fmt::Display for HoldingError {
                 f,
                 "requested close quantity {requested} exceeds open quantity {available}"
             ),
+            Self::DuplicateFillId { fill_id } => {
+                write!(
+                    f,
+                    "fill {} was already applied to this holding",
+                    fill_id.value()
+                )
+            }
             Self::Lot(err) => err.fmt(f),
         }
     }
@@ -156,7 +166,7 @@ impl Holding {
     }
 
     pub fn side(&self) -> Option<LotSide> {
-        self.lots.first().map(Lot::side)
+        self.lots.iter().find(|lot| lot.is_open()).map(Lot::side)
     }
 
     pub fn open_qty(&self) -> Decimal {
@@ -192,13 +202,13 @@ impl Holding {
     }
 
     pub fn open_lot(&mut self, lot: Lot) -> Result<&Lot, HoldingError> {
-        if let Some(existing_side) = self.side() {
-            if existing_side != lot.side() {
-                return Err(HoldingError::MixedLotSide {
-                    expected: existing_side,
-                    actual: lot.side(),
-                });
-            }
+        if let Some(existing_side) = self.side()
+            && existing_side != lot.side()
+        {
+            return Err(HoldingError::MixedLotSide {
+                expected: existing_side,
+                actual: lot.side(),
+            });
         }
 
         self.lots.push(lot);
@@ -210,6 +220,7 @@ impl Holding {
 
     pub fn open_lot_from_fill(&mut self, lot_id: LotId, fill: &Fill) -> Result<&Lot, HoldingError> {
         self.ensure_symbol_matches(fill.symbol())?;
+        self.ensure_fill_not_applied(fill.id())?;
         if fill.position_effect() != PositionEffect::Open {
             return Err(HoldingError::PositionEffectMismatch {
                 expected: PositionEffect::Open,
@@ -233,6 +244,7 @@ impl Holding {
 
     pub fn close_with_fill(&mut self, fill: &Fill) -> Result<HoldingClose, HoldingError> {
         self.ensure_symbol_matches(fill.symbol())?;
+        self.ensure_fill_not_applied(fill.id())?;
         if fill.position_effect() != PositionEffect::Close {
             return Err(HoldingError::PositionEffectMismatch {
                 expected: PositionEffect::Close,
@@ -332,6 +344,20 @@ impl Holding {
                 expected: self.symbol.clone(),
                 actual: symbol.to_owned(),
             });
+        }
+
+        Ok(())
+    }
+
+    fn ensure_fill_not_applied(&self, fill_id: FillId) -> Result<(), HoldingError> {
+        if self.lots.iter().any(|lot| {
+            lot.open_fill_id() == fill_id
+                || lot
+                    .close_events()
+                    .iter()
+                    .any(|close_event| close_event.close_fill_id == fill_id)
+        }) {
+            return Err(HoldingError::DuplicateFillId { fill_id });
         }
 
         Ok(())
@@ -557,6 +583,192 @@ mod tests {
             HoldingError::CloseExceedsOpenQuantity {
                 requested: dec(3, 0),
                 available: dec(2, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn holding_can_open_opposite_side_after_flattening() {
+        let mut holding = Holding::new(HoldingId::new(4), "AAPL", LotReliefMethod::Fifo).unwrap();
+
+        let open_long = Fill::new(
+            FillId::new(10),
+            OrderId::new(400),
+            "AAPL",
+            OrderSide::Buy,
+            PositionEffect::Open,
+            ts(24),
+            dec(2, 0),
+            dec(100, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+        let close_long = Fill::new(
+            FillId::new(11),
+            OrderId::new(401),
+            "AAPL",
+            OrderSide::Sell,
+            PositionEffect::Close,
+            ts(25),
+            dec(2, 0),
+            dec(101, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+        let open_short = Fill::new(
+            FillId::new(12),
+            OrderId::new(402),
+            "AAPL",
+            OrderSide::Sell,
+            PositionEffect::Open,
+            ts(26),
+            dec(1, 0),
+            dec(99, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+
+        holding
+            .open_lot_from_fill(LotId::new(40), &open_long)
+            .unwrap();
+        holding.close_with_fill(&close_long).unwrap();
+
+        assert!(holding.is_flat());
+        assert_eq!(holding.side(), None);
+        assert!(
+            holding
+                .open_lot_from_fill(LotId::new(41), &open_short)
+                .is_ok()
+        );
+        assert_eq!(holding.side(), Some(LotSide::Short));
+    }
+
+    #[test]
+    fn holding_close_on_flat_returns_no_open_lots() {
+        let mut holding = Holding::new(HoldingId::new(5), "AAPL", LotReliefMethod::Fifo).unwrap();
+
+        let open_long = Fill::new(
+            FillId::new(13),
+            OrderId::new(500),
+            "AAPL",
+            OrderSide::Buy,
+            PositionEffect::Open,
+            ts(24),
+            dec(1, 0),
+            dec(100, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+        let close_long = Fill::new(
+            FillId::new(14),
+            OrderId::new(501),
+            "AAPL",
+            OrderSide::Sell,
+            PositionEffect::Close,
+            ts(25),
+            dec(1, 0),
+            dec(101, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+        let extra_close = Fill::new(
+            FillId::new(15),
+            OrderId::new(502),
+            "AAPL",
+            OrderSide::Sell,
+            PositionEffect::Close,
+            ts(26),
+            dec(1, 0),
+            dec(102, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+
+        holding
+            .open_lot_from_fill(LotId::new(50), &open_long)
+            .unwrap();
+        holding.close_with_fill(&close_long).unwrap();
+
+        let err = holding.close_with_fill(&extra_close).unwrap_err();
+        assert_eq!(
+            err,
+            HoldingError::NoOpenLots {
+                symbol: "AAPL".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn holding_rejects_duplicate_open_fill_replay() {
+        let mut holding = Holding::new(HoldingId::new(6), "AAPL", LotReliefMethod::Fifo).unwrap();
+
+        let open_fill = Fill::new(
+            FillId::new(16),
+            OrderId::new(600),
+            "AAPL",
+            OrderSide::Buy,
+            PositionEffect::Open,
+            ts(24),
+            dec(1, 0),
+            dec(100, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+
+        holding
+            .open_lot_from_fill(LotId::new(60), &open_fill)
+            .unwrap();
+
+        let err = holding
+            .open_lot_from_fill(LotId::new(61), &open_fill)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            HoldingError::DuplicateFillId {
+                fill_id: FillId::new(16),
+            }
+        );
+    }
+
+    #[test]
+    fn holding_rejects_duplicate_close_fill_replay() {
+        let mut holding = Holding::new(HoldingId::new(7), "AAPL", LotReliefMethod::Fifo).unwrap();
+
+        let open_fill = Fill::new(
+            FillId::new(17),
+            OrderId::new(700),
+            "AAPL",
+            OrderSide::Buy,
+            PositionEffect::Open,
+            ts(24),
+            dec(2, 0),
+            dec(100, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+        let close_fill = Fill::new(
+            FillId::new(18),
+            OrderId::new(701),
+            "AAPL",
+            OrderSide::Sell,
+            PositionEffect::Close,
+            ts(25),
+            dec(1, 0),
+            dec(101, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+
+        holding
+            .open_lot_from_fill(LotId::new(70), &open_fill)
+            .unwrap();
+        holding.close_with_fill(&close_fill).unwrap();
+
+        let err = holding.close_with_fill(&close_fill).unwrap_err();
+        assert_eq!(
+            err,
+            HoldingError::DuplicateFillId {
+                fill_id: FillId::new(18),
             }
         );
     }
