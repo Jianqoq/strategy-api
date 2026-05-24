@@ -1,4 +1,4 @@
-use crate::{Bar, Strategy, ctx::Indicator};
+use crate::{Bar, Strategy, indicator::Indicator};
 
 // ── Signal ────────────────────────────────────────────────────────────────────
 
