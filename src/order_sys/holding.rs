@@ -1,3 +1,6 @@
+use std::cmp::Ordering;
+use std::collections::HashSet;
+
 use rust_decimal::Decimal;
 
 use crate::order_sys::fill::Fill;
@@ -5,10 +8,15 @@ use crate::order_sys::lot::{Lot, LotClose, LotError, LotSide};
 use crate::order_sys::order::{OrderSide, PositionEffect};
 use crate::order_sys::{FillId, HoldingId, LotId, OrderId};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LotReliefMethod {
     Fifo,
     Lifo,
+    Hifo,
+    MaxLoss,
+    MaxGain,
+    SpecificLot(Vec<LotId>),
+    AverageCost,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +47,19 @@ pub enum HoldingError {
     },
     DuplicateFillId {
         fill_id: FillId,
+    },
+    UnknownLotId {
+        lot_id: LotId,
+    },
+    LotNotOpen {
+        lot_id: LotId,
+    },
+    DuplicateLotIdSelection {
+        lot_id: LotId,
+    },
+    SpecificLotQuantityInsufficient {
+        requested: Decimal,
+        available: Decimal,
     },
     Lot(LotError),
 }
@@ -88,6 +109,26 @@ impl std::fmt::Display for HoldingError {
                     fill_id.value()
                 )
             }
+            Self::UnknownLotId { lot_id } => {
+                write!(f, "lot {} does not exist in this holding", lot_id.value())
+            }
+            Self::LotNotOpen { lot_id } => {
+                write!(f, "lot {} is not open", lot_id.value())
+            }
+            Self::DuplicateLotIdSelection { lot_id } => {
+                write!(
+                    f,
+                    "lot {} was selected more than once in SpecificLot",
+                    lot_id.value()
+                )
+            }
+            Self::SpecificLotQuantityInsufficient {
+                requested,
+                available,
+            } => write!(
+                f,
+                "specific lot selection covers {available}, below requested close quantity {requested}"
+            ),
             Self::Lot(err) => err.fmt(f),
         }
     }
@@ -130,6 +171,12 @@ pub struct Holding {
     lots: Vec<Lot>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClosePlanEntry {
+    lot_index: usize,
+    qty: Decimal,
+}
+
 impl Holding {
     pub fn new(
         id: HoldingId,
@@ -157,8 +204,12 @@ impl Holding {
         &self.symbol
     }
 
-    pub fn lot_relief_method(&self) -> LotReliefMethod {
-        self.lot_relief_method
+    pub fn lot_relief_method(&self) -> &LotReliefMethod {
+        &self.lot_relief_method
+    }
+
+    pub fn set_lot_relief_method(&mut self, lot_relief_method: LotReliefMethod) {
+        self.lot_relief_method = lot_relief_method;
     }
 
     pub fn lots(&self) -> &[Lot] {
@@ -243,6 +294,85 @@ impl Holding {
     }
 
     pub fn close_with_fill(&mut self, fill: &Fill) -> Result<HoldingClose, HoldingError> {
+        let close_plan = self.build_close_plan(fill, &self.lot_relief_method)?;
+        self.execute_close_plan(fill, close_plan)
+    }
+
+    pub fn close_with_fill_using(
+        &mut self,
+        fill: &Fill,
+        lot_relief_method: &LotReliefMethod,
+    ) -> Result<HoldingClose, HoldingError> {
+        let close_plan = self.build_close_plan(fill, lot_relief_method)?;
+        self.execute_close_plan(fill, close_plan)
+    }
+
+    fn execute_close_plan(
+        &mut self,
+        fill: &Fill,
+        close_plan: Vec<ClosePlanEntry>,
+    ) -> Result<HoldingClose, HoldingError> {
+        let mut remaining_fees = fill.fees();
+        let mut matches = Vec::with_capacity(close_plan.len());
+
+        for (plan_index, entry) in close_plan.iter().enumerate() {
+            let allocated_close_fees = if plan_index + 1 == close_plan.len() {
+                remaining_fees
+            } else {
+                fill.fees() * entry.qty / fill.qty()
+            };
+
+            let lot = &mut self.lots[entry.lot_index];
+            let close = lot
+                .close(
+                    fill.order_id(),
+                    fill.id(),
+                    fill.executed_at(),
+                    entry.qty,
+                    fill.price(),
+                    allocated_close_fees,
+                )?
+                .clone();
+
+            matches.push(HoldingCloseMatch {
+                lot_id: lot.id(),
+                lot_side: lot.side(),
+                close,
+            });
+            remaining_fees -= allocated_close_fees;
+        }
+
+        debug_assert!(
+            remaining_fees.is_zero(),
+            "close allocation left unmatched fees"
+        );
+
+        let total_realized_gross_pnl = matches.iter().fold(Decimal::ZERO, |sum, matched| {
+            sum + matched.close.realized_gross_pnl
+        });
+        let total_realized_net_pnl = matches.iter().fold(Decimal::ZERO, |sum, matched| {
+            sum + matched.close.realized_net_pnl
+        });
+
+        Ok(HoldingClose {
+            symbol: self.symbol.clone(),
+            close_order_id: fill.order_id(),
+            close_fill_id: fill.id(),
+            closed_qty: fill.qty(),
+            close_price: fill.price(),
+            close_fees: fill.fees(),
+            matches,
+            total_realized_gross_pnl,
+            total_realized_net_pnl,
+            remaining_open_qty: self.open_qty(),
+        })
+    }
+
+    fn build_close_plan(
+        &self,
+        fill: &Fill,
+        lot_relief_method: &LotReliefMethod,
+    ) -> Result<Vec<ClosePlanEntry>, HoldingError> {
         self.ensure_symbol_matches(fill.symbol())?;
         self.ensure_fill_not_applied(fill.id())?;
         if fill.position_effect() != PositionEffect::Close {
@@ -270,72 +400,38 @@ impl Holding {
             });
         }
 
-        let mut remaining_qty = fill.qty();
-        let mut remaining_fees = fill.fees();
-        let mut matches = Vec::new();
-
-        for lot_index in self.close_order_indices() {
-            if remaining_qty.is_zero() {
-                break;
+        let open_indices = self.open_lot_indices();
+        match lot_relief_method {
+            LotReliefMethod::Fifo => Ok(self.build_sequential_plan(open_indices, fill.qty())),
+            LotReliefMethod::Lifo => {
+                let mut ordered_indices = open_indices;
+                ordered_indices.reverse();
+                Ok(self.build_sequential_plan(ordered_indices, fill.qty()))
             }
-
-            let lot = &mut self.lots[lot_index];
-            let close_qty = remaining_qty.min(lot.remaining_qty());
-            let allocated_close_fees = if close_qty == remaining_qty {
-                remaining_fees
-            } else {
-                fill.fees() * close_qty / fill.qty()
-            };
-
-            let close = lot
-                .close(
-                    fill.order_id(),
-                    fill.id(),
-                    fill.executed_at(),
-                    close_qty,
-                    fill.price(),
-                    allocated_close_fees,
-                )?
-                .clone();
-
-            matches.push(HoldingCloseMatch {
-                lot_id: lot.id(),
-                lot_side: lot.side(),
-                close,
-            });
-
-            remaining_qty -= close_qty;
-            remaining_fees -= allocated_close_fees;
+            LotReliefMethod::Hifo => {
+                let mut ordered_indices = open_indices;
+                ordered_indices.sort_by(|left, right| self.compare_hifo(*left, *right));
+                Ok(self.build_sequential_plan(ordered_indices, fill.qty()))
+            }
+            LotReliefMethod::MaxLoss => {
+                let mut ordered_indices = open_indices;
+                ordered_indices
+                    .sort_by(|left, right| self.compare_estimated_pnl(*left, *right, fill.price()));
+                Ok(self.build_sequential_plan(ordered_indices, fill.qty()))
+            }
+            LotReliefMethod::MaxGain => {
+                let mut ordered_indices = open_indices;
+                ordered_indices
+                    .sort_by(|left, right| self.compare_estimated_pnl(*right, *left, fill.price()));
+                Ok(self.build_sequential_plan(ordered_indices, fill.qty()))
+            }
+            LotReliefMethod::SpecificLot(lot_ids) => {
+                self.build_specific_lot_plan(lot_ids, fill.qty())
+            }
+            LotReliefMethod::AverageCost => {
+                Ok(self.build_average_cost_plan(open_indices, fill.qty()))
+            }
         }
-
-        debug_assert!(
-            remaining_qty.is_zero(),
-            "close allocation left unmatched quantity"
-        );
-        debug_assert!(
-            remaining_fees.is_zero(),
-            "close allocation left unmatched fees"
-        );
-
-        let total_realized_gross_pnl = matches.iter().fold(Decimal::ZERO, |sum, matched| {
-            sum + matched.close.realized_gross_pnl
-        });
-        let total_realized_net_pnl = matches.iter().fold(Decimal::ZERO, |sum, matched| {
-            sum + matched.close.realized_net_pnl
-        });
-
-        Ok(HoldingClose {
-            symbol: self.symbol.clone(),
-            close_order_id: fill.order_id(),
-            close_fill_id: fill.id(),
-            closed_qty: fill.qty(),
-            close_price: fill.price(),
-            close_fees: fill.fees(),
-            matches,
-            total_realized_gross_pnl,
-            total_realized_net_pnl,
-            remaining_open_qty: self.open_qty(),
-        })
     }
 
     fn ensure_symbol_matches(&self, symbol: &str) -> Result<(), HoldingError> {
@@ -363,17 +459,178 @@ impl Holding {
         Ok(())
     }
 
-    fn close_order_indices(&self) -> Vec<usize> {
-        let open_indices = self
-            .lots
+    fn open_lot_indices(&self) -> Vec<usize> {
+        self.lots
             .iter()
             .enumerate()
-            .filter_map(|(index, lot)| lot.is_open().then_some(index));
+            .filter_map(|(index, lot)| lot.is_open().then_some(index))
+            .collect()
+    }
 
-        match self.lot_relief_method {
-            LotReliefMethod::Fifo => open_indices.collect(),
-            LotReliefMethod::Lifo => open_indices.rev().collect(),
+    fn build_sequential_plan(
+        &self,
+        ordered_indices: Vec<usize>,
+        requested_close_qty: Decimal,
+    ) -> Vec<ClosePlanEntry> {
+        let mut remaining_qty = requested_close_qty;
+        let mut close_plan = Vec::new();
+
+        for lot_index in ordered_indices {
+            if remaining_qty.is_zero() {
+                break;
+            }
+
+            let close_qty = remaining_qty.min(self.lots[lot_index].remaining_qty());
+            if close_qty.is_zero() {
+                continue;
+            }
+
+            close_plan.push(ClosePlanEntry {
+                lot_index,
+                qty: close_qty,
+            });
+            remaining_qty -= close_qty;
         }
+
+        debug_assert!(
+            remaining_qty.is_zero(),
+            "ordered close plan left unmatched quantity"
+        );
+
+        close_plan
+    }
+
+    fn build_average_cost_plan(
+        &self,
+        ordered_indices: Vec<usize>,
+        requested_close_qty: Decimal,
+    ) -> Vec<ClosePlanEntry> {
+        let mut remaining_close_qty = requested_close_qty;
+        let mut remaining_open_qty = ordered_indices.iter().fold(Decimal::ZERO, |sum, index| {
+            sum + self.lots[*index].remaining_qty()
+        });
+        let mut close_plan = Vec::new();
+
+        for (position, lot_index) in ordered_indices.iter().enumerate() {
+            if remaining_close_qty.is_zero() {
+                break;
+            }
+
+            let lot_qty = self.lots[*lot_index].remaining_qty();
+            let close_qty = if position + 1 == ordered_indices.len() {
+                remaining_close_qty
+            } else {
+                remaining_close_qty * lot_qty / remaining_open_qty
+            };
+
+            if !close_qty.is_zero() {
+                close_plan.push(ClosePlanEntry {
+                    lot_index: *lot_index,
+                    qty: close_qty,
+                });
+                remaining_close_qty -= close_qty;
+            }
+            remaining_open_qty -= lot_qty;
+        }
+
+        debug_assert!(
+            remaining_close_qty.is_zero(),
+            "average cost plan left unmatched quantity"
+        );
+
+        close_plan
+    }
+
+    fn build_specific_lot_plan(
+        &self,
+        lot_ids: &[LotId],
+        requested_close_qty: Decimal,
+    ) -> Result<Vec<ClosePlanEntry>, HoldingError> {
+        let mut seen_lot_ids = HashSet::new();
+        let mut remaining_qty = requested_close_qty;
+        let mut selected_available = Decimal::ZERO;
+        let mut close_plan = Vec::new();
+
+        for lot_id in lot_ids {
+            if !seen_lot_ids.insert(*lot_id) {
+                return Err(HoldingError::DuplicateLotIdSelection { lot_id: *lot_id });
+            }
+
+            let lot_index = self
+                .lots
+                .iter()
+                .position(|lot| lot.id() == *lot_id)
+                .ok_or(HoldingError::UnknownLotId { lot_id: *lot_id })?;
+            let lot = &self.lots[lot_index];
+            if !lot.is_open() {
+                return Err(HoldingError::LotNotOpen { lot_id: *lot_id });
+            }
+
+            selected_available += lot.remaining_qty();
+            if remaining_qty.is_zero() {
+                continue;
+            }
+
+            let close_qty = remaining_qty.min(lot.remaining_qty());
+            if close_qty.is_zero() {
+                continue;
+            }
+
+            close_plan.push(ClosePlanEntry {
+                lot_index,
+                qty: close_qty,
+            });
+            remaining_qty -= close_qty;
+        }
+
+        if !remaining_qty.is_zero() {
+            return Err(HoldingError::SpecificLotQuantityInsufficient {
+                requested: requested_close_qty,
+                available: selected_available,
+            });
+        }
+
+        Ok(close_plan)
+    }
+
+    fn compare_hifo(&self, left_index: usize, right_index: usize) -> Ordering {
+        self.fee_adjusted_open_basis(&self.lots[right_index])
+            .cmp(&self.fee_adjusted_open_basis(&self.lots[left_index]))
+            .then_with(|| self.lot_order_tiebreak(left_index, right_index))
+    }
+
+    fn compare_estimated_pnl(
+        &self,
+        left_index: usize,
+        right_index: usize,
+        close_price: Decimal,
+    ) -> Ordering {
+        self.estimated_unit_net_pnl(&self.lots[left_index], close_price)
+            .cmp(&self.estimated_unit_net_pnl(&self.lots[right_index], close_price))
+            .then_with(|| self.lot_order_tiebreak(left_index, right_index))
+    }
+
+    fn lot_order_tiebreak(&self, left_index: usize, right_index: usize) -> Ordering {
+        self.lots[left_index]
+            .opened_at()
+            .cmp(&self.lots[right_index].opened_at())
+            .then_with(|| self.lots[left_index].id().cmp(&self.lots[right_index].id()))
+    }
+
+    fn fee_adjusted_open_basis(&self, lot: &Lot) -> Decimal {
+        lot.open_price() + self.remaining_open_fees(lot) / lot.remaining_qty()
+    }
+
+    fn estimated_unit_net_pnl(&self, lot: &Lot, close_price: Decimal) -> Decimal {
+        let gross_unit_pnl = match lot.side() {
+            LotSide::Long => close_price - lot.open_price(),
+            LotSide::Short => lot.open_price() - close_price,
+        };
+        gross_unit_pnl - self.remaining_open_fees(lot) / lot.remaining_qty()
+    }
+
+    fn remaining_open_fees(&self, lot: &Lot) -> Decimal {
+        lot.open_fees() - lot.realized_open_fees()
     }
 }
 
@@ -396,10 +653,69 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 5, day, 9, 30, 0).unwrap()
     }
 
+    fn long_open_fill(fill_id: u64, order_id: u64, day: u32, qty: i64, price: i64) -> Fill {
+        Fill::new(
+            FillId::new(fill_id),
+            OrderId::new(order_id),
+            "AAPL",
+            OrderSide::Buy,
+            PositionEffect::Open,
+            ts(day),
+            dec(qty, 0),
+            dec(price, 0),
+            dec(0, 0),
+        )
+        .unwrap()
+    }
+
+    fn short_open_fill(fill_id: u64, order_id: u64, day: u32, qty: i64, price: i64) -> Fill {
+        Fill::new(
+            FillId::new(fill_id),
+            OrderId::new(order_id),
+            "AAPL",
+            OrderSide::Sell,
+            PositionEffect::Open,
+            ts(day),
+            dec(qty, 0),
+            dec(price, 0),
+            dec(0, 0),
+        )
+        .unwrap()
+    }
+
+    fn long_close_fill(fill_id: u64, order_id: u64, day: u32, qty: i64, price: i64) -> Fill {
+        Fill::new(
+            FillId::new(fill_id),
+            OrderId::new(order_id),
+            "AAPL",
+            OrderSide::Sell,
+            PositionEffect::Close,
+            ts(day),
+            dec(qty, 0),
+            dec(price, 0),
+            dec(0, 0),
+        )
+        .unwrap()
+    }
+
+    fn short_close_fill(fill_id: u64, order_id: u64, day: u32, qty: i64, price: i64) -> Fill {
+        Fill::new(
+            FillId::new(fill_id),
+            OrderId::new(order_id),
+            "AAPL",
+            OrderSide::Buy,
+            PositionEffect::Close,
+            ts(day),
+            dec(qty, 0),
+            dec(price, 0),
+            dec(0, 0),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn fifo_close_matches_oldest_lots_first() {
         let mut holding = Holding::new(HoldingId::new(1), "AAPL", LotReliefMethod::Fifo).unwrap();
-
         let open_one = Fill::new(
             FillId::new(1),
             OrderId::new(100),
@@ -465,7 +781,6 @@ mod tests {
     #[test]
     fn lifo_close_matches_newest_lots_first() {
         let mut holding = Holding::new(HoldingId::new(2), "AAPL", LotReliefMethod::Lifo).unwrap();
-
         let open_one = Fill::new(
             FillId::new(4),
             OrderId::new(200),
@@ -519,6 +834,152 @@ mod tests {
         assert_eq!(result.matches[1].close.qty, dec(1, 0));
         assert_eq!(result.total_realized_gross_pnl, dec(35, 0));
         assert_eq!(result.total_realized_net_pnl, dec(326, 1));
+    }
+
+    #[test]
+    fn hifo_close_matches_highest_cost_lots_first() {
+        let mut holding = Holding::new(HoldingId::new(8), "AAPL", LotReliefMethod::Hifo).unwrap();
+
+        holding
+            .open_lot_from_fill(LotId::new(80), &long_open_fill(80, 800, 24, 1, 100))
+            .unwrap();
+        holding
+            .open_lot_from_fill(LotId::new(81), &long_open_fill(81, 801, 25, 1, 110))
+            .unwrap();
+        holding
+            .open_lot_from_fill(LotId::new(82), &long_open_fill(82, 802, 26, 1, 105))
+            .unwrap();
+
+        let result = holding
+            .close_with_fill(&long_close_fill(83, 803, 27, 2, 120))
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].lot_id, LotId::new(81));
+        assert_eq!(result.matches[1].lot_id, LotId::new(82));
+        assert_eq!(result.total_realized_gross_pnl, dec(25, 0));
+    }
+
+    #[test]
+    fn max_loss_on_short_matches_worst_losing_lots_first() {
+        let mut holding =
+            Holding::new(HoldingId::new(9), "AAPL", LotReliefMethod::MaxLoss).unwrap();
+
+        holding
+            .open_lot_from_fill(LotId::new(90), &short_open_fill(90, 900, 24, 1, 100))
+            .unwrap();
+        holding
+            .open_lot_from_fill(LotId::new(91), &short_open_fill(91, 901, 25, 1, 110))
+            .unwrap();
+
+        let result = holding
+            .close_with_fill(&short_close_fill(92, 902, 26, 1, 105))
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].lot_id, LotId::new(90));
+        assert_eq!(result.total_realized_gross_pnl, dec(-5, 0));
+    }
+
+    #[test]
+    fn max_gain_on_short_matches_best_winning_lots_first() {
+        let mut holding =
+            Holding::new(HoldingId::new(10), "AAPL", LotReliefMethod::MaxGain).unwrap();
+
+        holding
+            .open_lot_from_fill(LotId::new(100), &short_open_fill(100, 1000, 24, 1, 100))
+            .unwrap();
+        holding
+            .open_lot_from_fill(LotId::new(101), &short_open_fill(101, 1001, 25, 1, 110))
+            .unwrap();
+
+        let result = holding
+            .close_with_fill(&short_close_fill(102, 1002, 26, 1, 105))
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].lot_id, LotId::new(101));
+        assert_eq!(result.total_realized_gross_pnl, dec(5, 0));
+    }
+
+    #[test]
+    fn specific_lot_matches_explicit_ids_in_requested_order() {
+        let mut holding = Holding::new(HoldingId::new(11), "AAPL", LotReliefMethod::Fifo).unwrap();
+
+        holding
+            .open_lot_from_fill(LotId::new(110), &long_open_fill(110, 1100, 24, 3, 100))
+            .unwrap();
+        holding
+            .open_lot_from_fill(LotId::new(111), &long_open_fill(111, 1101, 25, 3, 105))
+            .unwrap();
+        holding
+            .open_lot_from_fill(LotId::new(112), &long_open_fill(112, 1102, 26, 3, 110))
+            .unwrap();
+
+        let close = long_close_fill(113, 1103, 27, 5, 120);
+        let result = holding
+            .close_with_fill_using(
+                &close,
+                &LotReliefMethod::SpecificLot(vec![LotId::new(111), LotId::new(110)]),
+            )
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].lot_id, LotId::new(111));
+        assert_eq!(result.matches[0].close.qty, dec(3, 0));
+        assert_eq!(result.matches[1].lot_id, LotId::new(110));
+        assert_eq!(result.matches[1].close.qty, dec(2, 0));
+    }
+
+    #[test]
+    fn specific_lot_rejects_insufficient_selected_quantity() {
+        let mut holding = Holding::new(HoldingId::new(12), "AAPL", LotReliefMethod::Fifo).unwrap();
+
+        holding
+            .open_lot_from_fill(LotId::new(120), &long_open_fill(120, 1200, 24, 3, 100))
+            .unwrap();
+        holding
+            .open_lot_from_fill(LotId::new(121), &long_open_fill(121, 1201, 25, 3, 105))
+            .unwrap();
+
+        let err = holding
+            .close_with_fill_using(
+                &long_close_fill(122, 1202, 26, 5, 120),
+                &LotReliefMethod::SpecificLot(vec![LotId::new(121)]),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            HoldingError::SpecificLotQuantityInsufficient {
+                requested: dec(5, 0),
+                available: dec(3, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn average_cost_allocates_pro_rata_across_open_lots() {
+        let mut holding =
+            Holding::new(HoldingId::new(13), "AAPL", LotReliefMethod::AverageCost).unwrap();
+
+        holding
+            .open_lot_from_fill(LotId::new(130), &long_open_fill(130, 1300, 24, 4, 100))
+            .unwrap();
+        holding
+            .open_lot_from_fill(LotId::new(131), &long_open_fill(131, 1301, 25, 6, 110))
+            .unwrap();
+
+        let result = holding
+            .close_with_fill(&long_close_fill(132, 1302, 26, 5, 120))
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].lot_id, LotId::new(130));
+        assert_eq!(result.matches[0].close.qty, dec(2, 0));
+        assert_eq!(result.matches[1].lot_id, LotId::new(131));
+        assert_eq!(result.matches[1].close.qty, dec(3, 0));
+        assert_eq!(result.total_realized_gross_pnl, dec(70, 0));
     }
 
     #[test]
@@ -701,7 +1162,6 @@ mod tests {
     #[test]
     fn holding_rejects_duplicate_open_fill_replay() {
         let mut holding = Holding::new(HoldingId::new(6), "AAPL", LotReliefMethod::Fifo).unwrap();
-
         let open_fill = Fill::new(
             FillId::new(16),
             OrderId::new(600),
@@ -733,7 +1193,6 @@ mod tests {
     #[test]
     fn holding_rejects_duplicate_close_fill_replay() {
         let mut holding = Holding::new(HoldingId::new(7), "AAPL", LotReliefMethod::Fifo).unwrap();
-
         let open_fill = Fill::new(
             FillId::new(17),
             OrderId::new(700),
