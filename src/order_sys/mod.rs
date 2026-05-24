@@ -1,5 +1,8 @@
+pub mod execution_report;
+pub mod fill;
 pub mod holding;
 pub mod lot;
+pub mod order;
 
 macro_rules! impl_id {
     ($name:ident) => {
@@ -19,6 +22,8 @@ macro_rules! impl_id {
     };
 }
 
+impl_id!(HoldingId);
 impl_id!(LotId);
 impl_id!(OrderId);
 impl_id!(FillId);
+impl_id!(ExecutionReportId);
