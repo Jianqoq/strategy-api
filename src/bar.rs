@@ -15,6 +15,7 @@ pub struct Bar {
     pub volume: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Point {
     pub index: usize,
     pub price: f32,
