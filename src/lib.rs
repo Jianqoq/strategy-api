@@ -1,7 +1,7 @@
 pub mod bar;
 pub mod indicator;
-pub mod strategy;
 pub mod order_sys;
+pub mod strategy;
 
 pub use bar::Bar;
 

@@ -1,7 +1,6 @@
 use crate::{Bar, indicator::Indicator};
 
-pub struct Strategy {
-}
+pub struct Strategy {}
 
 // ── Signal ────────────────────────────────────────────────────────────────────
 
@@ -212,8 +211,7 @@ macro_rules! export_indicator {
         #[unsafe(no_mangle)]
         pub extern "C" fn on_finish(ctx: *mut $crate::Indicator) -> $crate::StateBlob {
             let ctx = unsafe { &mut *ctx };
-            let state =
-                <$ty as $crate::OnIndicator>::on_finish(&mut *get_instance(), ctx);
+            let state = <$ty as $crate::OnIndicator>::on_finish(&mut *get_instance(), ctx);
             let mut bytes = std::mem::ManuallyDrop::new(state);
             $crate::StateBlob {
                 ptr: bytes.as_mut_ptr(),
