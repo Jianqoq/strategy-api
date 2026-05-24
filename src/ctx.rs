@@ -71,13 +71,7 @@ pub struct Fill {
     /// Price at which the fill was executed
     pub price: f64,
     /// Quantity of the fill
-    /// Date and time of the fill
-    pub date: DateTime<Utc>,
-    /// Price at which the fill was executed
-    pub price: f64,
-    /// Quantity of the fill
     pub qty: f64,
-    /// Commission paid for the fill
     /// Commission paid for the fill
     pub commission: f64,
 }
@@ -131,7 +125,6 @@ pub struct Strategy {
 }
 
 impl Strategy {
-    pub fn new(account: Account) -> Self {
     pub fn new(account: Account) -> Self {
         Self {
             account,
