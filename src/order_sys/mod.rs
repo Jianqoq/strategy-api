@@ -27,10 +27,10 @@ pub mod order;
 macro_rules! impl_id {
     ($name:ident) => {
         #[doc = concat!(
-                    "Strongly typed identifier wrapper for `",
-                    stringify!($name),
-                    "` values inside `order_sys`."
-                )]
+                            "Strongly typed identifier wrapper for `",
+                            stringify!($name),
+                            "` values inside `order_sys`."
+                        )]
         #[repr(transparent)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(u64);

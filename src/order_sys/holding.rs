@@ -104,6 +104,11 @@ pub enum HoldingError {
         /// Identifier of the duplicate fill.
         fill_id: FillId,
     },
+    /// A new lot reused an identifier that already exists in the holding.
+    DuplicateLotId {
+        /// Duplicate lot identifier.
+        lot_id: LotId,
+    },
     /// A `SpecificLot` selection referenced a lot that does not exist here.
     UnknownLotId {
         /// Unknown lot identifier.
@@ -174,6 +179,9 @@ impl std::fmt::Display for HoldingError {
                     "fill {} was already applied to this holding",
                     fill_id.value()
                 )
+            }
+            Self::DuplicateLotId { lot_id } => {
+                write!(f, "lot {} already exists in this holding", lot_id.value())
             }
             Self::UnknownLotId { lot_id } => {
                 write!(f, "lot {} does not exist in this holding", lot_id.value())
@@ -359,6 +367,14 @@ impl Holding {
     /// The holding forbids mixed long and short exposure. Closed historical lots
     /// do not determine side; only currently open lots do.
     pub fn open_lot(&mut self, lot: Lot) -> Result<&Lot, HoldingError> {
+        if self
+            .lots
+            .iter()
+            .any(|existing_lot| existing_lot.id() == lot.id())
+        {
+            return Err(HoldingError::DuplicateLotId { lot_id: lot.id() });
+        }
+
         if let Some(existing_side) = self.side()
             && existing_side != lot.side()
         {
@@ -1379,5 +1395,47 @@ mod tests {
                 fill_id: FillId::new(18),
             }
         );
+    }
+
+    #[test]
+    fn holding_rejects_duplicate_lot_id_reuse() {
+        let mut holding = Holding::new(HoldingId::new(14), "AAPL", LotReliefMethod::Fifo).unwrap();
+
+        let open_one = long_open_fill(140, 1400, 24, 1, 100);
+        let open_two = long_open_fill(141, 1401, 25, 1, 101);
+
+        holding
+            .open_lot_from_fill(LotId::new(140), &open_one)
+            .unwrap();
+
+        let err = holding
+            .open_lot_from_fill(LotId::new(140), &open_two)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            HoldingError::DuplicateLotId {
+                lot_id: LotId::new(140),
+            }
+        );
+    }
+
+    #[test]
+    fn single_close_fill_can_relieve_multiple_lots() {
+        let mut holding = Holding::new(HoldingId::new(15), "AAPL", LotReliefMethod::Fifo).unwrap();
+
+        holding
+            .open_lot_from_fill(LotId::new(150), &long_open_fill(150, 1500, 24, 1, 100))
+            .unwrap();
+        holding
+            .open_lot_from_fill(LotId::new(151), &long_open_fill(151, 1501, 25, 1, 101))
+            .unwrap();
+
+        let result = holding
+            .close_with_fill(&long_close_fill(152, 1502, 26, 2, 110))
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].close.close_fill_id, FillId::new(152));
+        assert_eq!(result.matches[1].close.close_fill_id, FillId::new(152));
     }
 }

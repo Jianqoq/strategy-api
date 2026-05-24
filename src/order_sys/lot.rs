@@ -65,6 +65,11 @@ pub enum LotError {
         /// The identifier of the already closed lot.
         lot_id: LotId,
     },
+    /// The same close fill identifier was replayed into the same lot.
+    DuplicateCloseFillId {
+        /// Duplicate close fill identifier.
+        fill_id: FillId,
+    },
 }
 
 impl std::fmt::Display for LotError {
@@ -95,6 +100,13 @@ impl std::fmt::Display for LotError {
             ),
             Self::LotAlreadyClosed { lot_id } => {
                 write!(f, "lot {} is already closed", lot_id.value())
+            }
+            Self::DuplicateCloseFillId { fill_id } => {
+                write!(
+                    f,
+                    "close fill {} was already applied to this lot",
+                    fill_id.value()
+                )
             }
         }
     }
@@ -242,6 +254,16 @@ impl Lot {
         validate_positive_quantity(qty)?;
         validate_positive_price(price)?;
         validate_non_negative_fees(close_fees)?;
+
+        if self
+            .close_events
+            .iter()
+            .any(|close_event| close_event.close_fill_id == close_fill_id)
+        {
+            return Err(LotError::DuplicateCloseFillId {
+                fill_id: close_fill_id,
+            });
+        }
 
         if closed_at < self.updated_at {
             return Err(LotError::EventOutOfOrder {
@@ -637,6 +659,48 @@ mod tests {
             LotError::EventOutOfOrder {
                 previous_timestamp: ts(24),
                 new_timestamp: ts(23),
+            }
+        );
+    }
+
+    #[test]
+    fn close_rejects_duplicate_close_fill_replay() {
+        let mut lot = Lot::open(
+            LotId::new(5),
+            LotSide::Long,
+            OrderId::new(50),
+            FillId::new(500),
+            ts(24),
+            dec(3, 0),
+            dec(100, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+
+        lot.close(
+            OrderId::new(51),
+            FillId::new(501),
+            ts(25),
+            dec(1, 0),
+            dec(101, 0),
+            dec(0, 0),
+        )
+        .unwrap();
+
+        let err = lot
+            .close(
+                OrderId::new(52),
+                FillId::new(501),
+                ts(26),
+                dec(1, 0),
+                dec(102, 0),
+                dec(0, 0),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            LotError::DuplicateCloseFillId {
+                fill_id: FillId::new(501),
             }
         );
     }
