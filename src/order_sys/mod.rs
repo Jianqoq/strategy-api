@@ -8,6 +8,7 @@
 //! - [`lot`] stores tax-lot style position fragments and realized PnL history.
 //! - [`holding`] aggregates many lots under one symbol and applies lot-relief rules.
 //! - [`execution_report`] snapshots order state for downstream consumers.
+//! - [`system`] provides a high-level facade for order submission and fill application.
 //!
 //! The identifiers defined in this module are intentionally strong types so that
 //! order, fill, holding, lot, and execution-report references cannot be mixed up
@@ -23,14 +24,16 @@ pub mod holding;
 pub mod lot;
 /// Order intent and order lifecycle state transitions.
 pub mod order;
+/// High-level facade that wires orders, fills, holdings, and reports together.
+pub mod system;
 
 macro_rules! impl_id {
     ($name:ident) => {
         #[doc = concat!(
-                            "Strongly typed identifier wrapper for `",
-                            stringify!($name),
-                            "` values inside `order_sys`."
-                        )]
+                                            "Strongly typed identifier wrapper for `",
+                                            stringify!($name),
+                                            "` values inside `order_sys`."
+                                        )]
         #[repr(transparent)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(u64);
