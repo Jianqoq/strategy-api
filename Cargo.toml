@@ -7,7 +7,5 @@ edition = "2024"
 crate-type = ["rlib"]
 
 [dependencies]
-rustc-hash = "2"
-chrono = "0.4.44"
-rust_decimal = "1"
-thiserror = "2"
+nautilus-core = "0.57.0"
+nautilus-model = "0.57.0"
