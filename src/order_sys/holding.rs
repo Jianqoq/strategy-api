@@ -188,6 +188,34 @@ pub struct HoldingClose {
     pub remaining_open_qty: Decimal,
 }
 
+/// Point-in-time PnL snapshot for one holding at a given mark price.
+///
+/// `unrealized_net_pnl` subtracts only the still-unrealized portion of
+/// open-side fees already paid when the lots were opened. It does not attempt
+/// to predict future exit fees because those depend on how the position will be
+/// closed later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoldingPnl {
+    /// Symbol of the holding.
+    pub symbol: String,
+    /// Current open side of the holding, if any.
+    pub side: Option<LotSide>,
+    /// Remaining open quantity across all lots.
+    pub open_qty: Decimal,
+    /// Mark price used for the unrealized snapshot.
+    pub mark_price: Decimal,
+    /// Sum of realized gross PnL across all lots.
+    pub realized_gross_pnl: Decimal,
+    /// Sum of realized net PnL across all lots.
+    pub realized_net_pnl: Decimal,
+    /// Gross PnL of all still-open quantity at the supplied mark.
+    pub unrealized_gross_pnl: Decimal,
+    /// Portion of already-paid open fees not yet recognized through closes.
+    pub unrealized_open_fees: Decimal,
+    /// Unrealized PnL net of remaining open fees, but before any unknown future exit fees.
+    pub unrealized_net_pnl: Decimal,
+}
+
 /// Per-symbol aggregate that owns all lots.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Holding {
@@ -296,6 +324,59 @@ impl Holding {
         self.lots
             .iter()
             .fold(Decimal::ZERO, |sum, lot| sum + lot.realized_net_pnl())
+    }
+
+    /// Returns mark-to-market gross PnL across all still-open lots.
+    pub fn unrealized_gross_pnl(&self, mark_price: Decimal) -> Decimal {
+        self.lots
+            .iter()
+            .filter(|lot| lot.is_open())
+            .fold(Decimal::ZERO, |sum, lot| {
+                let lot_gross_pnl = match lot.side() {
+                    LotSide::Long => (mark_price - lot.open_price()) * lot.remaining_qty(),
+                    LotSide::Short => (lot.open_price() - mark_price) * lot.remaining_qty(),
+                };
+                sum + lot_gross_pnl
+            })
+    }
+
+    /// Returns still-unrealized open fees across all currently open lots.
+    pub fn unrealized_open_fees(&self) -> Decimal {
+        self.lots
+            .iter()
+            .filter(|lot| lot.is_open())
+            .fold(Decimal::ZERO, |sum, lot| {
+                sum + self.remaining_open_fees(lot)
+            })
+    }
+
+    /// Returns mark-to-market PnL net of the remaining open-side fees.
+    ///
+    /// Future close fees are intentionally excluded because they are not known
+    /// until the eventual exit execution arrives.
+    pub fn unrealized_net_pnl(&self, mark_price: Decimal) -> Decimal {
+        self.unrealized_gross_pnl(mark_price) - self.unrealized_open_fees()
+    }
+
+    /// Returns a point-in-time PnL snapshot for the holding.
+    pub fn pnl(&self, mark_price: Decimal) -> HoldingPnl {
+        let realized_gross_pnl = self.realized_gross_pnl();
+        let realized_net_pnl = self.realized_net_pnl();
+        let unrealized_gross_pnl = self.unrealized_gross_pnl(mark_price);
+        let unrealized_open_fees = self.unrealized_open_fees();
+        let unrealized_net_pnl = unrealized_gross_pnl - unrealized_open_fees;
+
+        HoldingPnl {
+            symbol: self.symbol.clone(),
+            side: self.side(),
+            open_qty: self.open_qty(),
+            mark_price,
+            realized_gross_pnl,
+            realized_net_pnl,
+            unrealized_gross_pnl,
+            unrealized_open_fees,
+            unrealized_net_pnl,
+        }
     }
 
     /// Inserts a pre-built lot into the holding.
@@ -812,6 +893,111 @@ mod tests {
             dec(0, 0),
         )
         .unwrap()
+    }
+
+    fn long_open_fill_with_fees(
+        fill_id: u64,
+        order_id: u64,
+        day: u32,
+        qty: i64,
+        price: i64,
+        fees: Decimal,
+    ) -> Fill {
+        Fill::new(
+            FillId::new(fill_id),
+            OrderId::new(order_id),
+            "AAPL",
+            OrderSide::Buy,
+            PositionEffect::Open,
+            ts(day),
+            dec(qty, 0),
+            dec(price, 0),
+            fees,
+        )
+        .unwrap()
+    }
+
+    fn short_open_fill_with_fees(
+        fill_id: u64,
+        order_id: u64,
+        day: u32,
+        qty: i64,
+        price: i64,
+        fees: Decimal,
+    ) -> Fill {
+        Fill::new(
+            FillId::new(fill_id),
+            OrderId::new(order_id),
+            "AAPL",
+            OrderSide::Sell,
+            PositionEffect::Open,
+            ts(day),
+            dec(qty, 0),
+            dec(price, 0),
+            fees,
+        )
+        .unwrap()
+    }
+
+    fn long_close_fill_with_fees(
+        fill_id: u64,
+        order_id: u64,
+        day: u32,
+        qty: i64,
+        price: i64,
+        fees: Decimal,
+    ) -> Fill {
+        Fill::new(
+            FillId::new(fill_id),
+            OrderId::new(order_id),
+            "AAPL",
+            OrderSide::Sell,
+            PositionEffect::Close,
+            ts(day),
+            dec(qty, 0),
+            dec(price, 0),
+            fees,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn holding_pnl_snapshot_combines_realized_and_unrealized_pnl() {
+        let mut holding = Holding::new(HoldingId::new(1), "AAPL", LotReliefMethod::Fifo).unwrap();
+        let open = long_open_fill_with_fees(1, 100, 24, 10, 100, dec(2, 0));
+        let close = long_close_fill_with_fees(2, 101, 25, 4, 110, dec(1, 0));
+
+        holding.open_lot_from_fill(LotId::new(10), &open).unwrap();
+        holding.close_with_fill(&close).unwrap();
+
+        let pnl = holding.pnl(dec(105, 0));
+        assert_eq!(pnl.symbol, "AAPL");
+        assert_eq!(pnl.side, Some(LotSide::Long));
+        assert_eq!(pnl.open_qty, dec(6, 0));
+        assert_eq!(pnl.mark_price, dec(105, 0));
+        assert_eq!(pnl.realized_gross_pnl, dec(40, 0));
+        assert_eq!(pnl.realized_net_pnl, dec(382, 1));
+        assert_eq!(pnl.unrealized_gross_pnl, dec(30, 0));
+        assert_eq!(pnl.unrealized_open_fees, dec(12, 1));
+        assert_eq!(pnl.unrealized_net_pnl, dec(288, 1));
+        assert_eq!(holding.unrealized_gross_pnl(dec(105, 0)), dec(30, 0));
+        assert_eq!(holding.unrealized_net_pnl(dec(105, 0)), dec(288, 1));
+    }
+
+    #[test]
+    fn short_holding_unrealized_pnl_marks_to_market_correctly() {
+        let mut holding = Holding::new(HoldingId::new(1), "AAPL", LotReliefMethod::Fifo).unwrap();
+        let open = short_open_fill_with_fees(1, 100, 24, 5, 100, dec(15, 1));
+
+        holding.open_lot_from_fill(LotId::new(10), &open).unwrap();
+
+        let pnl = holding.pnl(dec(90, 0));
+        assert_eq!(pnl.side, Some(LotSide::Short));
+        assert_eq!(pnl.open_qty, dec(5, 0));
+        assert_eq!(pnl.realized_net_pnl, Decimal::ZERO);
+        assert_eq!(pnl.unrealized_gross_pnl, dec(50, 0));
+        assert_eq!(pnl.unrealized_open_fees, dec(15, 1));
+        assert_eq!(pnl.unrealized_net_pnl, dec(485, 1));
     }
 
     #[test]

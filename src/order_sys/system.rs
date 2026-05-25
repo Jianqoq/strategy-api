@@ -21,7 +21,7 @@ use thiserror::Error;
 
 use crate::order_sys::execution_report::ExecutionReport;
 use crate::order_sys::fill::Fill;
-use crate::order_sys::holding::{Holding, HoldingClose, HoldingError, LotReliefMethod};
+use crate::order_sys::holding::{Holding, HoldingClose, HoldingError, HoldingPnl, LotReliefMethod};
 use crate::order_sys::lot::LotSide;
 use crate::order_sys::order::{
     Order, OrderError, OrderSide, OrderStatus, OrderType, PositionEffect, TimeInForce,
@@ -244,6 +244,12 @@ pub enum OrderSystemError {
         /// Order identifier supplied by the caller.
         order_id: OrderId,
     },
+    /// No holding has ever been created for the requested symbol.
+    #[error("symbol {symbol} has no holding history")]
+    UnknownHoldingSymbol {
+        /// Symbol requested by the caller.
+        symbol: String,
+    },
     /// The same fill identifier was applied to the system twice.
     #[error("fill {} was already applied to the order system", .fill_id.value())]
     DuplicateFillId {
@@ -406,6 +412,22 @@ impl OrderSystem {
     /// Returns an iterator over every holding.
     pub fn holdings(&self) -> impl Iterator<Item = &Holding> {
         self.holdings.values()
+    }
+
+    /// Returns a point-in-time PnL snapshot for one symbol holding.
+    pub fn holding_pnl(
+        &self,
+        symbol: &str,
+        mark_price: Decimal,
+    ) -> Result<HoldingPnl, OrderSystemError> {
+        self.ensure_symbol_not_blank(symbol)?;
+        let holding =
+            self.holdings
+                .get(symbol)
+                .ok_or_else(|| OrderSystemError::UnknownHoldingSymbol {
+                    symbol: symbol.to_owned(),
+                })?;
+        Ok(holding.pnl(mark_price))
     }
 
     /// Returns one fill by identifier.
@@ -1305,6 +1327,50 @@ mod tests {
         .unwrap()
     }
 
+    fn open_fill_with_fees(
+        order_id: u64,
+        fill_id: u64,
+        day: u32,
+        qty: i64,
+        price: i64,
+        fees: Decimal,
+    ) -> Fill {
+        Fill::new(
+            FillId::new(fill_id),
+            OrderId::new(order_id),
+            "AAPL",
+            OrderSide::Buy,
+            PositionEffect::Open,
+            ts(day),
+            dec(qty, 0),
+            dec(price, 0),
+            fees,
+        )
+        .unwrap()
+    }
+
+    fn close_fill_with_fees(
+        order_id: u64,
+        fill_id: u64,
+        day: u32,
+        qty: i64,
+        price: i64,
+        fees: Decimal,
+    ) -> Fill {
+        Fill::new(
+            FillId::new(fill_id),
+            OrderId::new(order_id),
+            "AAPL",
+            OrderSide::Sell,
+            PositionEffect::Close,
+            ts(day),
+            dec(qty, 0),
+            dec(price, 0),
+            fees,
+        )
+        .unwrap()
+    }
+
     fn submit_and_fill_long(
         system: &mut OrderSystem,
         day: u32,
@@ -1395,6 +1461,117 @@ mod tests {
         assert_eq!(system.holding("AAPL").unwrap().side(), Some(LotSide::Long));
         assert!(system.fill(FillId::new(10)).is_some());
         assert_eq!(system.execution_reports().len(), 3);
+    }
+
+    #[test]
+    fn holding_pnl_returns_realized_and_unrealized_snapshot() {
+        let mut system = OrderSystem::new(LotReliefMethod::Fifo);
+        let open = system
+            .submit_order(SubmitOrderRequest::new(
+                "AAPL",
+                OrderSide::Buy,
+                PositionEffect::Open,
+                OrderType::Market,
+                TimeInForce::Day,
+                ts(24),
+                dec(10, 0),
+                None,
+                None,
+            ))
+            .unwrap();
+        system
+            .apply_fill(open_fill_with_fees(
+                open.order.id().value(),
+                10,
+                24,
+                10,
+                100,
+                dec(2, 0),
+            ))
+            .unwrap();
+
+        let close = system
+            .submit_close_order(SubmitCloseOrderRequest::new(
+                "AAPL",
+                ts(25),
+                dec(4, 0),
+                OrderType::Market,
+                TimeInForce::Day,
+                None,
+                None,
+            ))
+            .unwrap();
+        system
+            .apply_fill(close_fill_with_fees(
+                close.order.id().value(),
+                11,
+                25,
+                4,
+                110,
+                dec(1, 0),
+            ))
+            .unwrap();
+
+        let pnl = system.holding_pnl("AAPL", dec(105, 0)).unwrap();
+        assert_eq!(pnl.realized_gross_pnl, dec(40, 0));
+        assert_eq!(pnl.realized_net_pnl, dec(382, 1));
+        assert_eq!(pnl.unrealized_gross_pnl, dec(30, 0));
+        assert_eq!(pnl.unrealized_open_fees, dec(12, 1));
+        assert_eq!(pnl.unrealized_net_pnl, dec(288, 1));
+        assert_eq!(pnl.open_qty, dec(6, 0));
+        assert_eq!(pnl.side, Some(LotSide::Long));
+    }
+
+    #[test]
+    fn holding_pnl_preserves_realized_history_after_flatten_and_rejects_unknown_symbol() {
+        let mut system = OrderSystem::new(LotReliefMethod::Fifo);
+        let open = system
+            .submit_order(SubmitOrderRequest::new(
+                "AAPL",
+                OrderSide::Buy,
+                PositionEffect::Open,
+                OrderType::Market,
+                TimeInForce::Day,
+                ts(24),
+                dec(2, 0),
+                None,
+                None,
+            ))
+            .unwrap();
+        system
+            .apply_fill(open_fill(open.order.id().value(), 10, 24, 2, 100))
+            .unwrap();
+
+        let close = system
+            .submit_close_order(SubmitCloseOrderRequest::new(
+                "AAPL",
+                ts(25),
+                dec(2, 0),
+                OrderType::Market,
+                TimeInForce::Day,
+                None,
+                None,
+            ))
+            .unwrap();
+        system
+            .apply_fill(close_fill(close.order.id().value(), 11, 25, 2, 110))
+            .unwrap();
+
+        let pnl = system.holding_pnl("AAPL", dec(120, 0)).unwrap();
+        assert_eq!(pnl.open_qty, Decimal::ZERO);
+        assert_eq!(pnl.side, None);
+        assert_eq!(pnl.realized_gross_pnl, dec(20, 0));
+        assert_eq!(pnl.realized_net_pnl, dec(20, 0));
+        assert_eq!(pnl.unrealized_gross_pnl, Decimal::ZERO);
+        assert_eq!(pnl.unrealized_net_pnl, Decimal::ZERO);
+
+        let err = system.holding_pnl("MSFT", dec(100, 0)).unwrap_err();
+        assert_eq!(
+            err,
+            OrderSystemError::UnknownHoldingSymbol {
+                symbol: "MSFT".to_owned(),
+            }
+        );
     }
 
     #[test]
