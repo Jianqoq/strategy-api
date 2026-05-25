@@ -3,6 +3,7 @@
 //! This module groups the primary building blocks needed to model an
 //! audit-friendly trading workflow:
 //!
+//! - [`account`] models account-level cash state.
 //! - [`order`] describes client intent and the order state machine.
 //! - [`fill`] stores immutable execution facts reported by a venue or simulator.
 //! - [`lot`] stores tax-lot style position fragments and realized PnL history.
@@ -14,6 +15,8 @@
 //! order, fill, holding, lot, and execution-report references cannot be mixed up
 //! accidentally at compile time.
 
+/// Account-level models such as cash accounts.
+pub mod account;
 /// Execution report snapshots derived from order-state transitions.
 pub mod execution_report;
 /// Immutable execution facts such as price, quantity, fees, and venue metadata.
@@ -52,6 +55,7 @@ macro_rules! impl_id {
     };
 }
 
+impl_id!(AccountId);
 impl_id!(HoldingId);
 impl_id!(LotId);
 impl_id!(OrderId);
