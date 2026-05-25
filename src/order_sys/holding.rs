@@ -21,6 +21,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use rust_decimal::Decimal;
+use thiserror::Error;
 
 use crate::order_sys::fill::Fill;
 use crate::order_sys::lot::{Lot, LotClose, LotError, LotSide};
@@ -55,11 +56,13 @@ pub enum LotReliefMethod {
 }
 
 /// Errors raised while mutating a holding or building a close plan.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum HoldingError {
     /// The symbol string was empty or whitespace.
+    #[error("holding symbol cannot be empty")]
     EmptySymbol,
     /// A fill referenced a different symbol from the holding.
+    #[error("holding symbol mismatch: expected {expected}, got {actual}")]
     SymbolMismatch {
         /// Symbol stored on the holding.
         expected: String,
@@ -67,6 +70,7 @@ pub enum HoldingError {
         actual: String,
     },
     /// The caller attempted to mix long and short lots in one holding.
+    #[error("holding mixes lot sides: expected {expected:?}, got {actual:?}")]
     MixedLotSide {
         /// Side already present in open lots.
         expected: LotSide,
@@ -74,6 +78,7 @@ pub enum HoldingError {
         actual: LotSide,
     },
     /// The caller used a fill with the wrong position effect for the operation.
+    #[error("holding expected position effect {expected:?}, got {actual:?}")]
     PositionEffectMismatch {
         /// Position effect expected by the holding operation.
         expected: PositionEffect,
@@ -81,6 +86,7 @@ pub enum HoldingError {
         actual: PositionEffect,
     },
     /// The fill side cannot close the currently open lot side.
+    #[error("fill side {fill_side:?} does not close {holding_side:?} lots")]
     CloseSideMismatch {
         /// Side of the currently open exposure.
         holding_side: LotSide,
@@ -88,11 +94,13 @@ pub enum HoldingError {
         fill_side: OrderSide,
     },
     /// A close was requested while the holding had no open lots.
+    #[error("holding for {symbol} has no open lots")]
     NoOpenLots {
         /// Symbol of the holding.
         symbol: String,
     },
     /// Requested close quantity exceeded total open quantity.
+    #[error("requested close quantity {requested} exceeds open quantity {available}")]
     CloseExceedsOpenQuantity {
         /// Quantity requested by the close fill.
         requested: Decimal,
@@ -100,31 +108,39 @@ pub enum HoldingError {
         available: Decimal,
     },
     /// The same fill was replayed into the holding twice.
+    #[error("fill {} was already applied to this holding", .fill_id.value())]
     DuplicateFillId {
         /// Identifier of the duplicate fill.
         fill_id: FillId,
     },
     /// A new lot reused an identifier that already exists in the holding.
+    #[error("lot {} already exists in this holding", .lot_id.value())]
     DuplicateLotId {
         /// Duplicate lot identifier.
         lot_id: LotId,
     },
     /// A `SpecificLot` selection referenced a lot that does not exist here.
+    #[error("lot {} does not exist in this holding", .lot_id.value())]
     UnknownLotId {
         /// Unknown lot identifier.
         lot_id: LotId,
     },
     /// A `SpecificLot` selection referenced a lot that is already closed.
+    #[error("lot {} is not open", .lot_id.value())]
     LotNotOpen {
         /// Lot identifier that is not currently open.
         lot_id: LotId,
     },
     /// A `SpecificLot` selection listed the same lot more than once.
+    #[error("lot {} was selected more than once in SpecificLot", .lot_id.value())]
     DuplicateLotIdSelection {
         /// Duplicate lot identifier.
         lot_id: LotId,
     },
     /// The selected lots in `SpecificLot` did not cover the requested close.
+    #[error(
+        "specific lot selection covers {available}, below requested close quantity {requested}"
+    )]
     SpecificLotQuantityInsufficient {
         /// Quantity requested by the close fill.
         requested: Decimal,
@@ -132,88 +148,8 @@ pub enum HoldingError {
         available: Decimal,
     },
     /// Wrapped error bubbled up from an individual lot.
-    Lot(LotError),
-}
-
-impl std::fmt::Display for HoldingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptySymbol => write!(f, "holding symbol cannot be empty"),
-            Self::SymbolMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "holding symbol mismatch: expected {expected}, got {actual}"
-                )
-            }
-            Self::MixedLotSide { expected, actual } => write!(
-                f,
-                "holding mixes lot sides: expected {:?}, got {:?}",
-                expected, actual
-            ),
-            Self::PositionEffectMismatch { expected, actual } => write!(
-                f,
-                "holding expected position effect {:?}, got {:?}",
-                expected, actual
-            ),
-            Self::CloseSideMismatch {
-                holding_side,
-                fill_side,
-            } => write!(
-                f,
-                "fill side {:?} does not close {:?} lots",
-                fill_side, holding_side
-            ),
-            Self::NoOpenLots { symbol } => {
-                write!(f, "holding for {symbol} has no open lots")
-            }
-            Self::CloseExceedsOpenQuantity {
-                requested,
-                available,
-            } => write!(
-                f,
-                "requested close quantity {requested} exceeds open quantity {available}"
-            ),
-            Self::DuplicateFillId { fill_id } => {
-                write!(
-                    f,
-                    "fill {} was already applied to this holding",
-                    fill_id.value()
-                )
-            }
-            Self::DuplicateLotId { lot_id } => {
-                write!(f, "lot {} already exists in this holding", lot_id.value())
-            }
-            Self::UnknownLotId { lot_id } => {
-                write!(f, "lot {} does not exist in this holding", lot_id.value())
-            }
-            Self::LotNotOpen { lot_id } => {
-                write!(f, "lot {} is not open", lot_id.value())
-            }
-            Self::DuplicateLotIdSelection { lot_id } => {
-                write!(
-                    f,
-                    "lot {} was selected more than once in SpecificLot",
-                    lot_id.value()
-                )
-            }
-            Self::SpecificLotQuantityInsufficient {
-                requested,
-                available,
-            } => write!(
-                f,
-                "specific lot selection covers {available}, below requested close quantity {requested}"
-            ),
-            Self::Lot(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for HoldingError {}
-
-impl From<LotError> for HoldingError {
-    fn from(value: LotError) -> Self {
-        Self::Lot(value)
-    }
+    #[error(transparent)]
+    Lot(#[from] LotError),
 }
 
 /// One realized lot match produced by a holding-level close operation.

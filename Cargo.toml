@@ -10,3 +10,4 @@ crate-type = ["rlib"]
 rustc-hash = "2"
 chrono = "0.4.44"
 rust_decimal = "1"
+thiserror = "2"

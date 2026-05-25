@@ -7,6 +7,7 @@
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use thiserror::Error;
 
 use crate::order_sys::{FillId, LotId, OrderId};
 
@@ -29,24 +30,28 @@ pub enum LotStatus {
 }
 
 /// Domain errors raised while creating or closing a lot.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum LotError {
     /// The supplied quantity was zero or negative.
+    #[error("quantity must be positive, got {quantity}")]
     NonPositiveQuantity {
         /// The invalid quantity value supplied by the caller.
         quantity: Decimal,
     },
     /// The supplied price was zero or negative.
+    #[error("price must be positive, got {price}")]
     NonPositivePrice {
         /// The invalid price value supplied by the caller.
         price: Decimal,
     },
     /// Fees must not be negative.
+    #[error("fees cannot be negative, got {fees}")]
     NegativeFees {
         /// The invalid fee amount supplied by the caller.
         fees: Decimal,
     },
     /// A close request attempted to close more than the remaining lot quantity.
+    #[error("close quantity {requested} exceeds remaining quantity {remaining}")]
     CloseExceedsRemaining {
         /// The quantity requested by the caller.
         requested: Decimal,
@@ -54,6 +59,9 @@ pub enum LotError {
         remaining: Decimal,
     },
     /// Audit events must be applied in non-decreasing timestamp order.
+    #[error(
+        "event timestamp {new_timestamp} is earlier than the previous audit timestamp {previous_timestamp}"
+    )]
     EventOutOfOrder {
         /// The most recent timestamp already stored on the lot.
         previous_timestamp: DateTime<Utc>,
@@ -61,58 +69,18 @@ pub enum LotError {
         new_timestamp: DateTime<Utc>,
     },
     /// A fully closed lot cannot be closed again.
+    #[error("lot {} is already closed", .lot_id.value())]
     LotAlreadyClosed {
         /// The identifier of the already closed lot.
         lot_id: LotId,
     },
     /// The same close fill identifier was replayed into the same lot.
+    #[error("close fill {} was already applied to this lot", .fill_id.value())]
     DuplicateCloseFillId {
         /// Duplicate close fill identifier.
         fill_id: FillId,
     },
 }
-
-impl std::fmt::Display for LotError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NonPositiveQuantity { quantity } => {
-                write!(f, "quantity must be positive, got {quantity}")
-            }
-            Self::NonPositivePrice { price } => {
-                write!(f, "price must be positive, got {price}")
-            }
-            Self::NegativeFees { fees } => {
-                write!(f, "fees cannot be negative, got {fees}")
-            }
-            Self::CloseExceedsRemaining {
-                requested,
-                remaining,
-            } => write!(
-                f,
-                "close quantity {requested} exceeds remaining quantity {remaining}"
-            ),
-            Self::EventOutOfOrder {
-                previous_timestamp,
-                new_timestamp,
-            } => write!(
-                f,
-                "event timestamp {new_timestamp} is earlier than the previous audit timestamp {previous_timestamp}"
-            ),
-            Self::LotAlreadyClosed { lot_id } => {
-                write!(f, "lot {} is already closed", lot_id.value())
-            }
-            Self::DuplicateCloseFillId { fill_id } => {
-                write!(
-                    f,
-                    "close fill {} was already applied to this lot",
-                    fill_id.value()
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for LotError {}
 
 /// One realized-close event applied to a lot.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use thiserror::Error;
 
 use crate::order_sys::order::{OrderSide, PositionEffect};
 use crate::order_sys::{FillId, OrderId};
@@ -22,45 +23,30 @@ pub enum FillLiquidity {
 }
 
 /// Domain errors raised while constructing a fill.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum FillError {
     /// The symbol string was empty or whitespace.
+    #[error("fill symbol cannot be empty")]
     EmptySymbol,
     /// The executed quantity must be strictly positive.
+    #[error("fill quantity must be positive, got {quantity}")]
     NonPositiveQuantity {
         /// The invalid quantity supplied by the caller.
         quantity: Decimal,
     },
     /// The execution price must be strictly positive.
+    #[error("fill price must be positive, got {price}")]
     NonPositivePrice {
         /// The invalid price supplied by the caller.
         price: Decimal,
     },
     /// Fees must not be negative.
+    #[error("fill fees cannot be negative, got {fees}")]
     NegativeFees {
         /// The invalid fee amount supplied by the caller.
         fees: Decimal,
     },
 }
-
-impl std::fmt::Display for FillError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptySymbol => write!(f, "fill symbol cannot be empty"),
-            Self::NonPositiveQuantity { quantity } => {
-                write!(f, "fill quantity must be positive, got {quantity}")
-            }
-            Self::NonPositivePrice { price } => {
-                write!(f, "fill price must be positive, got {price}")
-            }
-            Self::NegativeFees { fees } => {
-                write!(f, "fill fees cannot be negative, got {fees}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for FillError {}
 
 /// Immutable record of one execution slice.
 #[derive(Clone, Debug, PartialEq, Eq)]

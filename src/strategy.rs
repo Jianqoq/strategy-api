@@ -2,6 +2,7 @@ use std::convert::TryFrom;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use thiserror::Error;
 
 use crate::Bar;
 use crate::bar::Point;
@@ -89,13 +90,20 @@ impl OrderKind {
 }
 
 /// Errors raised by the strategy convenience layer.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Error)]
 pub enum StrategyError {
     /// A context-dependent method was called before any bar was provided.
+    #[error(
+        "strategy context has no current bar; call from `on_bar` or set time explicitly through the lower-level order system"
+    )]
     MissingBarContext,
     /// A symbol-dependent method was called without setting a default symbol.
+    #[error(
+        "strategy context has no default symbol; call `set_default_symbol` or use the lower-level order system"
+    )]
     MissingDefaultSymbol,
     /// A floating-point input could not be converted into a finite decimal.
+    #[error("field `{field}` contains an invalid numeric value {value}")]
     InvalidNumber {
         /// Name of the invalid field.
         field: &'static str,
@@ -103,37 +111,8 @@ pub enum StrategyError {
         value: f64,
     },
     /// Wrapped error bubbled up from the order system.
-    OrderSystem(OrderSystemError),
-}
-
-impl std::fmt::Display for StrategyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingBarContext => write!(
-                f,
-                "strategy context has no current bar; call from `on_bar` or set time explicitly through the lower-level order system"
-            ),
-            Self::MissingDefaultSymbol => write!(
-                f,
-                "strategy context has no default symbol; call `set_default_symbol` or use the lower-level order system"
-            ),
-            Self::InvalidNumber { field, value } => {
-                write!(
-                    f,
-                    "field `{field}` contains an invalid numeric value {value}"
-                )
-            }
-            Self::OrderSystem(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for StrategyError {}
-
-impl From<OrderSystemError> for StrategyError {
-    fn from(value: OrderSystemError) -> Self {
-        Self::OrderSystem(value)
-    }
+    #[error(transparent)]
+    OrderSystem(#[from] OrderSystemError),
 }
 
 /// Strategy runtime context passed into [`OnStrategy::on_bar`].

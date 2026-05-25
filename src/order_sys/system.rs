@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use thiserror::Error;
 
 use crate::order_sys::execution_report::ExecutionReport;
 use crate::order_sys::fill::Fill;
@@ -235,24 +236,30 @@ pub struct AppliedFill {
 }
 
 /// Errors raised by the high-level order-system facade.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum OrderSystemError {
     /// Unknown order identifier.
+    #[error("order {} does not exist", .order_id.value())]
     UnknownOrderId {
         /// Order identifier supplied by the caller.
         order_id: OrderId,
     },
     /// The same fill identifier was applied to the system twice.
+    #[error("fill {} was already applied to the order system", .fill_id.value())]
     DuplicateFillId {
         /// Duplicate fill identifier.
         fill_id: FillId,
     },
     /// There is no open position for the requested symbol.
+    #[error("symbol {symbol} has no open position")]
     NoOpenPosition {
         /// Symbol requested by the caller.
         symbol: String,
     },
     /// An opening order tried to add exposure on the opposite side.
+    #[error(
+        "cannot open {requested:?} exposure for {symbol} while {holding_side:?} exposure is already open"
+    )]
     OpenSideMismatch {
         /// Symbol being traded.
         symbol: String,
@@ -262,6 +269,9 @@ pub enum OrderSystemError {
         holding_side: LotSide,
     },
     /// A live opening order already reserves the opposite opening side.
+    #[error(
+        "cannot open {requested:?} exposure for {symbol} while a live open order already reserves {live_order_side:?} exposure"
+    )]
     LiveOpenOrderSideConflict {
         /// Symbol being traded.
         symbol: String,
@@ -272,6 +282,7 @@ pub enum OrderSystemError {
     },
     /// A contingent reversal open order cannot accept fills before its
     /// prerequisite close order completes.
+    #[error("order {} is not active yet; it is waiting on order {} to complete", .order_id.value(), .waiting_on_order_id.value())]
     OrderNotActive {
         /// Inactive order identifier.
         order_id: OrderId,
@@ -280,11 +291,13 @@ pub enum OrderSystemError {
     },
     /// Automatic reversal is blocked while other live open orders still exist
     /// for the symbol.
+    #[error("automatic reversal for {symbol} is blocked while other live open orders exist")]
     ReversalBlockedByLiveOpenOrders {
         /// Symbol requested by the caller.
         symbol: String,
     },
     /// A closing order side did not match the currently open position side.
+    #[error("close order side {requested:?} does not match {holding_side:?} exposure in {symbol}")]
     CloseSideMismatch {
         /// Symbol being traded.
         symbol: String,
@@ -294,6 +307,9 @@ pub enum OrderSystemError {
         holding_side: LotSide,
     },
     /// The requested close quantity exceeded unreserved closeable quantity.
+    #[error(
+        "close quantity {requested} exceeds currently available quantity {available} for {symbol}"
+    )]
     CloseQuantityExceedsAvailable {
         /// Symbol being traded.
         symbol: String,
@@ -303,102 +319,17 @@ pub enum OrderSystemError {
         available: Decimal,
     },
     /// The symbol has an open position, but all of it is already reserved.
+    #[error("symbol {symbol} has no unreserved quantity left to close")]
     NoClosableQuantity {
         /// Symbol requested by the caller.
         symbol: String,
     },
     /// Wrapped order-level error.
-    Order(OrderError),
+    #[error(transparent)]
+    Order(#[from] OrderError),
     /// Wrapped holding-level error.
-    Holding(HoldingError),
-}
-
-impl std::fmt::Display for OrderSystemError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownOrderId { order_id } => {
-                write!(f, "order {} does not exist", order_id.value())
-            }
-            Self::DuplicateFillId { fill_id } => {
-                write!(
-                    f,
-                    "fill {} was already applied to the order system",
-                    fill_id.value()
-                )
-            }
-            Self::NoOpenPosition { symbol } => write!(f, "symbol {symbol} has no open position"),
-            Self::OpenSideMismatch {
-                symbol,
-                requested,
-                holding_side,
-            } => write!(
-                f,
-                "cannot open {:?} exposure for {symbol} while {:?} exposure is already open",
-                requested, holding_side
-            ),
-            Self::LiveOpenOrderSideConflict {
-                symbol,
-                requested,
-                live_order_side,
-            } => write!(
-                f,
-                "cannot open {:?} exposure for {symbol} while a live open order already reserves {:?} exposure",
-                requested, live_order_side
-            ),
-            Self::OrderNotActive {
-                order_id,
-                waiting_on_order_id,
-            } => write!(
-                f,
-                "order {} is not active yet; it is waiting on order {} to complete",
-                order_id.value(),
-                waiting_on_order_id.value()
-            ),
-            Self::ReversalBlockedByLiveOpenOrders { symbol } => write!(
-                f,
-                "automatic reversal for {symbol} is blocked while other live open orders exist"
-            ),
-            Self::CloseSideMismatch {
-                symbol,
-                requested,
-                holding_side,
-            } => write!(
-                f,
-                "close order side {:?} does not match {:?} exposure in {symbol}",
-                requested, holding_side
-            ),
-            Self::CloseQuantityExceedsAvailable {
-                symbol,
-                requested,
-                available,
-            } => write!(
-                f,
-                "close quantity {requested} exceeds currently available quantity {available} for {symbol}"
-            ),
-            Self::NoClosableQuantity { symbol } => {
-                write!(
-                    f,
-                    "symbol {symbol} has no unreserved quantity left to close"
-                )
-            }
-            Self::Order(err) => err.fmt(f),
-            Self::Holding(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for OrderSystemError {}
-
-impl From<OrderError> for OrderSystemError {
-    fn from(value: OrderError) -> Self {
-        Self::Order(value)
-    }
-}
-
-impl From<HoldingError> for OrderSystemError {
-    fn from(value: HoldingError) -> Self {
-        Self::Holding(value)
-    }
+    #[error(transparent)]
+    Holding(#[from] HoldingError),
 }
 
 /// Internal tracked order entry that remembers per-order close overrides.

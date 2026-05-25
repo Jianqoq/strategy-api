@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use thiserror::Error;
 
 use crate::order_sys::fill::Fill;
 use crate::order_sys::lot::LotSide;
@@ -91,29 +92,39 @@ pub enum OrderStatus {
 }
 
 /// Domain errors raised while validating or mutating an order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum OrderError {
     /// The symbol string was empty or whitespace.
+    #[error("order symbol cannot be empty")]
     EmptySymbol,
     /// Requested quantity must be strictly positive.
+    #[error("order quantity must be positive, got {quantity}")]
     NonPositiveQuantity {
         /// Invalid quantity supplied by the caller.
         quantity: Decimal,
     },
     /// Prices must be strictly positive when present.
+    #[error("order price must be positive, got {price}")]
     NonPositivePrice {
         /// Invalid price supplied by the caller.
         price: Decimal,
     },
     /// A limit order requires a limit price.
+    #[error("limit order requires a limit price")]
     MissingLimitPrice,
     /// A stop order requires a stop price.
+    #[error("stop order requires a stop price")]
     MissingStopPrice,
     /// A limit price was supplied to an order type that does not use one.
+    #[error("limit price is not valid for this order type")]
     UnexpectedLimitPrice,
     /// A stop price was supplied to an order type that does not use one.
+    #[error("stop price is not valid for this order type")]
     UnexpectedStopPrice,
     /// Order events must be applied in non-decreasing timestamp order.
+    #[error(
+        "order event timestamp {new_timestamp} is earlier than the previous order event {previous_timestamp}"
+    )]
     EventOutOfOrder {
         /// Timestamp already stored on the order.
         previous_timestamp: DateTime<Utc>,
@@ -121,6 +132,7 @@ pub enum OrderError {
         new_timestamp: DateTime<Utc>,
     },
     /// The fill referenced a different order.
+    #[error("fill order mismatch: expected {}, got {}", .expected.value(), .actual.value())]
     FillOrderMismatch {
         /// Order expected by the aggregate.
         expected: OrderId,
@@ -128,6 +140,7 @@ pub enum OrderError {
         actual: OrderId,
     },
     /// The fill symbol did not match the order symbol.
+    #[error("fill symbol mismatch: expected {expected}, got {actual}")]
     FillSymbolMismatch {
         /// Symbol stored on the order.
         expected: String,
@@ -135,6 +148,7 @@ pub enum OrderError {
         actual: String,
     },
     /// The fill side did not match the order side.
+    #[error("fill side mismatch: expected {expected:?}, got {actual:?}")]
     FillSideMismatch {
         /// Side stored on the order.
         expected: OrderSide,
@@ -142,6 +156,7 @@ pub enum OrderError {
         actual: OrderSide,
     },
     /// The fill position effect did not match the order position effect.
+    #[error("fill position effect mismatch: expected {expected:?}, got {actual:?}")]
     FillPositionEffectMismatch {
         /// Position effect stored on the order.
         expected: PositionEffect,
@@ -149,6 +164,7 @@ pub enum OrderError {
         actual: PositionEffect,
     },
     /// The fill quantity exceeded the order's remaining leaves quantity.
+    #[error("fill quantity {fill_qty} exceeds order leaves quantity {leaves_qty}")]
     FillQuantityExceedsLeaves {
         /// Quantity carried by the fill.
         fill_qty: Decimal,
@@ -156,11 +172,13 @@ pub enum OrderError {
         leaves_qty: Decimal,
     },
     /// The same fill identifier was applied more than once.
+    #[error("fill {} was already applied to this order", .fill_id.value())]
     DuplicateFillId {
         /// Duplicate fill identifier.
         fill_id: FillId,
     },
     /// The order is already terminal and cannot accept more lifecycle events.
+    #[error("order {} is in terminal status {status:?}", .order_id.value())]
     TerminalStatus {
         /// Terminal order identifier.
         order_id: OrderId,
@@ -168,6 +186,7 @@ pub enum OrderError {
         status: OrderStatus,
     },
     /// A rejection after any fills would destroy audit consistency.
+    #[error("order {} cannot be rejected after fills; filled quantity is {filled_qty}", .order_id.value())]
     RejectAfterFill {
         /// Order being rejected.
         order_id: OrderId,
@@ -175,82 +194,6 @@ pub enum OrderError {
         filled_qty: Decimal,
     },
 }
-
-impl std::fmt::Display for OrderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptySymbol => write!(f, "order symbol cannot be empty"),
-            Self::NonPositiveQuantity { quantity } => {
-                write!(f, "order quantity must be positive, got {quantity}")
-            }
-            Self::NonPositivePrice { price } => {
-                write!(f, "order price must be positive, got {price}")
-            }
-            Self::MissingLimitPrice => write!(f, "limit order requires a limit price"),
-            Self::MissingStopPrice => write!(f, "stop order requires a stop price"),
-            Self::UnexpectedLimitPrice => write!(f, "limit price is not valid for this order type"),
-            Self::UnexpectedStopPrice => write!(f, "stop price is not valid for this order type"),
-            Self::EventOutOfOrder {
-                previous_timestamp,
-                new_timestamp,
-            } => write!(
-                f,
-                "order event timestamp {new_timestamp} is earlier than the previous order event {previous_timestamp}"
-            ),
-            Self::FillOrderMismatch { expected, actual } => write!(
-                f,
-                "fill order mismatch: expected {}, got {}",
-                expected.value(),
-                actual.value()
-            ),
-            Self::FillSymbolMismatch { expected, actual } => {
-                write!(f, "fill symbol mismatch: expected {expected}, got {actual}")
-            }
-            Self::FillSideMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "fill side mismatch: expected {:?}, got {:?}",
-                    expected, actual
-                )
-            }
-            Self::FillPositionEffectMismatch { expected, actual } => write!(
-                f,
-                "fill position effect mismatch: expected {:?}, got {:?}",
-                expected, actual
-            ),
-            Self::FillQuantityExceedsLeaves {
-                fill_qty,
-                leaves_qty,
-            } => write!(
-                f,
-                "fill quantity {fill_qty} exceeds order leaves quantity {leaves_qty}"
-            ),
-            Self::DuplicateFillId { fill_id } => {
-                write!(
-                    f,
-                    "fill {} was already applied to this order",
-                    fill_id.value()
-                )
-            }
-            Self::TerminalStatus { order_id, status } => write!(
-                f,
-                "order {} is in terminal status {:?}",
-                order_id.value(),
-                status
-            ),
-            Self::RejectAfterFill {
-                order_id,
-                filled_qty,
-            } => write!(
-                f,
-                "order {} cannot be rejected after fills; filled quantity is {filled_qty}",
-                order_id.value()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for OrderError {}
 
 /// Order aggregate and state machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
