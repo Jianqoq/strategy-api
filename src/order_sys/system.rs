@@ -54,6 +54,8 @@ pub struct SubmitOrderRequest {
     pub stop_price: Option<Decimal>,
     /// Optional one-off close matching policy.
     pub lot_relief_method: Option<LotReliefMethod>,
+    /// Whether opposite exposure should be auto-reversed instead of rejected.
+    pub allow_reversal: bool,
 }
 
 impl SubmitOrderRequest {
@@ -81,12 +83,19 @@ impl SubmitOrderRequest {
             limit_price,
             stop_price,
             lot_relief_method: None,
+            allow_reversal: false,
         }
     }
 
     /// Attaches a close-specific lot-relief override to the request.
     pub fn with_lot_relief_method(mut self, lot_relief_method: LotReliefMethod) -> Self {
         self.lot_relief_method = Some(lot_relief_method);
+        self
+    }
+
+    /// Enables or disables automatic reversal for opposite exposure.
+    pub fn with_allow_reversal(mut self, allow_reversal: bool) -> Self {
+        self.allow_reversal = allow_reversal;
         self
     }
 }
@@ -207,6 +216,9 @@ pub struct SubmittedOrder {
     pub order: Order,
     /// `PendingNew` execution report emitted for the submission.
     pub report: ExecutionReport,
+    /// Auto-generated close order that must complete before this order can open
+    /// opposite-side exposure, when reversal was requested.
+    pub auto_close_order: Option<Box<SubmittedOrder>>,
 }
 
 /// Return payload produced when a fill is applied through the facade.
@@ -257,6 +269,20 @@ pub enum OrderSystemError {
         requested: OrderSide,
         /// Side already reserved by another live open order.
         live_order_side: OrderSide,
+    },
+    /// A contingent reversal open order cannot accept fills before its
+    /// prerequisite close order completes.
+    OrderNotActive {
+        /// Inactive order identifier.
+        order_id: OrderId,
+        /// Close order that must complete first.
+        waiting_on_order_id: OrderId,
+    },
+    /// Automatic reversal is blocked while other live open orders still exist
+    /// for the symbol.
+    ReversalBlockedByLiveOpenOrders {
+        /// Symbol requested by the caller.
+        symbol: String,
     },
     /// A closing order side did not match the currently open position side.
     CloseSideMismatch {
@@ -319,6 +345,19 @@ impl std::fmt::Display for OrderSystemError {
                 "cannot open {:?} exposure for {symbol} while a live open order already reserves {:?} exposure",
                 requested, live_order_side
             ),
+            Self::OrderNotActive {
+                order_id,
+                waiting_on_order_id,
+            } => write!(
+                f,
+                "order {} is not active yet; it is waiting on order {} to complete",
+                order_id.value(),
+                waiting_on_order_id.value()
+            ),
+            Self::ReversalBlockedByLiveOpenOrders { symbol } => write!(
+                f,
+                "automatic reversal for {symbol} is blocked while other live open orders exist"
+            ),
             Self::CloseSideMismatch {
                 symbol,
                 requested,
@@ -367,6 +406,7 @@ impl From<HoldingError> for OrderSystemError {
 struct TrackedOrder {
     order: Order,
     close_lot_relief_method: Option<LotReliefMethod>,
+    contingent_on_order_id: Option<OrderId>,
 }
 
 /// In-memory facade that wires order submission, fills, holdings, and reports.
@@ -486,33 +526,12 @@ impl OrderSystem {
         &mut self,
         request: SubmitOrderRequest,
     ) -> Result<SubmittedOrder, OrderSystemError> {
+        if let Some(reversal_submission) = self.try_submit_reversal(&request)? {
+            return Ok(reversal_submission);
+        }
+
         self.validate_submission(&request)?;
-
-        let order_id = self.allocate_order_id();
-        let order = Order::new(
-            order_id,
-            request.symbol,
-            request.side,
-            request.position_effect,
-            request.order_type,
-            request.time_in_force,
-            request.submitted_at,
-            request.qty,
-            request.limit_price,
-            request.stop_price,
-        )?;
-        let report = ExecutionReport::pending_new(self.allocate_execution_report_id(), &order);
-
-        self.orders.insert(
-            order_id,
-            TrackedOrder {
-                order: order.clone(),
-                close_lot_relief_method: request.lot_relief_method,
-            },
-        );
-        self.execution_reports.push(report.clone());
-
-        Ok(SubmittedOrder { order, report })
+        self.submit_single_order(request, None)
     }
 
     /// Submits a close order whose side is inferred from the current holding.
@@ -578,6 +597,12 @@ impl OrderSystem {
                 .orders
                 .get_mut(&order_id)
                 .ok_or(OrderSystemError::UnknownOrderId { order_id })?;
+            if let Some(waiting_on_order_id) = tracked_order.contingent_on_order_id {
+                return Err(OrderSystemError::OrderNotActive {
+                    order_id,
+                    waiting_on_order_id,
+                });
+            }
             tracked_order.order.acknowledge(acknowledged_at)?;
             tracked_order.order.clone()
         };
@@ -605,6 +630,7 @@ impl OrderSystem {
 
         let report = ExecutionReport::canceled(report_id, &order_snapshot, canceled_at, None);
         self.execution_reports.push(report.clone());
+        self.cancel_contingent_orders(order_id, canceled_at);
         Ok(report)
     }
 
@@ -628,6 +654,7 @@ impl OrderSystem {
 
         let report = ExecutionReport::rejected(report_id, &order_snapshot, rejected_at, reason);
         self.execution_reports.push(report.clone());
+        self.reject_contingent_orders(order_id, rejected_at, "parent reversal close order failed");
         Ok(report)
     }
 
@@ -649,6 +676,12 @@ impl OrderSystem {
                 .ok_or(OrderSystemError::UnknownOrderId {
                     order_id: fill.order_id(),
                 })?;
+        if let Some(waiting_on_order_id) = tracked_order.contingent_on_order_id {
+            return Err(OrderSystemError::OrderNotActive {
+                order_id: fill.order_id(),
+                waiting_on_order_id,
+            });
+        }
 
         let mut order_snapshot = tracked_order.order.clone();
         order_snapshot.record_fill(&fill)?;
@@ -716,6 +749,9 @@ impl OrderSystem {
         );
         self.fills.insert(fill.id(), fill.clone());
         self.execution_reports.push(report.clone());
+        if order_snapshot.status() == OrderStatus::Filled {
+            self.activate_contingent_orders(fill.order_id());
+        }
 
         Ok(AppliedFill {
             order: order_snapshot,
@@ -723,6 +759,111 @@ impl OrderSystem {
             opened_lot_id,
             holding_close,
         })
+    }
+
+    /// Submits one already-validated order and emits its `PendingNew` report.
+    fn submit_single_order(
+        &mut self,
+        request: SubmitOrderRequest,
+        contingent_on_order_id: Option<OrderId>,
+    ) -> Result<SubmittedOrder, OrderSystemError> {
+        let order_id = self.allocate_order_id();
+        let order = Order::new(
+            order_id,
+            request.symbol,
+            request.side,
+            request.position_effect,
+            request.order_type,
+            request.time_in_force,
+            request.submitted_at,
+            request.qty,
+            request.limit_price,
+            request.stop_price,
+        )?;
+        let report = ExecutionReport::pending_new(self.allocate_execution_report_id(), &order);
+
+        self.orders.insert(
+            order_id,
+            TrackedOrder {
+                order: order.clone(),
+                close_lot_relief_method: request.lot_relief_method,
+                contingent_on_order_id,
+            },
+        );
+        self.execution_reports.push(report.clone());
+
+        Ok(SubmittedOrder {
+            order,
+            report,
+            auto_close_order: None,
+        })
+    }
+
+    /// Builds a two-leg reversal submission when the request opens exposure on
+    /// the opposite side of the currently open holding.
+    fn try_submit_reversal(
+        &mut self,
+        request: &SubmitOrderRequest,
+    ) -> Result<Option<SubmittedOrder>, OrderSystemError> {
+        if request.position_effect != PositionEffect::Open || !request.allow_reversal {
+            return Ok(None);
+        }
+        self.ensure_symbol_not_blank(&request.symbol)?;
+
+        let Some(holding) = self.holdings.get(request.symbol.as_str()) else {
+            return Ok(None);
+        };
+        let Some(holding_side) = holding.side() else {
+            return Ok(None);
+        };
+        if holding_side == request.side.to_open_lot_side() {
+            return Ok(None);
+        }
+        if self.has_live_open_orders(request.symbol.as_str()) {
+            return Err(OrderSystemError::ReversalBlockedByLiveOpenOrders {
+                symbol: request.symbol.clone(),
+            });
+        }
+
+        let open_qty = holding.open_qty();
+        let available_close_qty = self.available_close_qty(&request.symbol)?;
+        if available_close_qty != open_qty {
+            return Err(OrderSystemError::CloseQuantityExceedsAvailable {
+                symbol: request.symbol.clone(),
+                requested: open_qty,
+                available: available_close_qty,
+            });
+        }
+
+        let close_request = SubmitOrderRequest::new(
+            request.symbol.clone(),
+            request.side,
+            PositionEffect::Close,
+            request.order_type,
+            request.time_in_force,
+            request.submitted_at,
+            open_qty,
+            request.limit_price,
+            request.stop_price,
+        );
+        self.validate_close_submission(&close_request)?;
+        let close_submission = self.submit_single_order(close_request, None)?;
+
+        let open_request = SubmitOrderRequest::new(
+            request.symbol.clone(),
+            request.side,
+            PositionEffect::Open,
+            request.order_type,
+            request.time_in_force,
+            request.submitted_at,
+            request.qty,
+            request.limit_price,
+            request.stop_price,
+        );
+        let mut open_submission =
+            self.submit_single_order(open_request, Some(close_submission.order.id()))?;
+        open_submission.auto_close_order = Some(Box::new(close_submission));
+        Ok(Some(open_submission))
     }
 
     /// Returns the total leaves quantity of all live close orders for one symbol.
@@ -740,6 +881,18 @@ impl OrderSystem {
             .fold(Decimal::ZERO, |sum, tracked_order| {
                 sum + tracked_order.order.leaves_qty()
             })
+    }
+
+    /// Returns `true` when any live open order already exists for the symbol.
+    fn has_live_open_orders(&self, symbol: &str) -> bool {
+        self.orders.values().any(|tracked_order| {
+            tracked_order.order.symbol() == symbol
+                && tracked_order.order.position_effect() == PositionEffect::Open
+                && matches!(
+                    tracked_order.order.status(),
+                    OrderStatus::Pending | OrderStatus::Working | OrderStatus::PartiallyFilled
+                )
+        })
     }
 
     /// Validates a submission request against current holdings and reservations.
@@ -914,6 +1067,100 @@ impl OrderSystem {
             })
             .map(|tracked_order| tracked_order.order.side())
             .find(|live_order_side| *live_order_side != requested_side)
+    }
+
+    /// Activates any contingent orders waiting on the completed parent order.
+    fn activate_contingent_orders(&mut self, parent_order_id: OrderId) {
+        for tracked_order in self.orders.values_mut() {
+            if tracked_order.contingent_on_order_id == Some(parent_order_id) {
+                tracked_order.contingent_on_order_id = None;
+            }
+        }
+    }
+
+    /// Cascades cancellation from a parent reversal close order to its staged
+    /// contingent open orders.
+    fn cancel_contingent_orders(&mut self, parent_order_id: OrderId, canceled_at: DateTime<Utc>) {
+        let dependent_order_ids: Vec<OrderId> = self
+            .orders
+            .iter()
+            .filter_map(|(order_id, tracked_order)| {
+                (tracked_order.contingent_on_order_id == Some(parent_order_id)).then_some(*order_id)
+            })
+            .collect();
+
+        for dependent_order_id in dependent_order_ids {
+            let order_snapshot = {
+                let tracked_order = self
+                    .orders
+                    .get_mut(&dependent_order_id)
+                    .expect("dependent order must exist while cascading cancel");
+                if tracked_order.order.status() == OrderStatus::Canceled
+                    || tracked_order.order.status() == OrderStatus::Rejected
+                    || tracked_order.order.status() == OrderStatus::Filled
+                {
+                    continue;
+                }
+                tracked_order
+                    .order
+                    .cancel(canceled_at)
+                    .expect("contingent order must cancel cleanly during parent cancel");
+                tracked_order.contingent_on_order_id = None;
+                tracked_order.order.clone()
+            };
+            let report = ExecutionReport::canceled(
+                self.allocate_execution_report_id(),
+                &order_snapshot,
+                canceled_at,
+                Some("canceled because reversal close order was canceled".to_owned()),
+            );
+            self.execution_reports.push(report);
+        }
+    }
+
+    /// Cascades rejection from a parent reversal close order to its staged
+    /// contingent open orders.
+    fn reject_contingent_orders(
+        &mut self,
+        parent_order_id: OrderId,
+        rejected_at: DateTime<Utc>,
+        reason: &str,
+    ) {
+        let dependent_order_ids: Vec<OrderId> = self
+            .orders
+            .iter()
+            .filter_map(|(order_id, tracked_order)| {
+                (tracked_order.contingent_on_order_id == Some(parent_order_id)).then_some(*order_id)
+            })
+            .collect();
+
+        for dependent_order_id in dependent_order_ids {
+            let order_snapshot = {
+                let tracked_order = self
+                    .orders
+                    .get_mut(&dependent_order_id)
+                    .expect("dependent order must exist while cascading reject");
+                if tracked_order.order.status() == OrderStatus::Canceled
+                    || tracked_order.order.status() == OrderStatus::Rejected
+                    || tracked_order.order.status() == OrderStatus::Filled
+                {
+                    continue;
+                }
+                tracked_order
+                    .order
+                    .reject(rejected_at, reason.to_owned())
+                    .expect("contingent order must reject cleanly during parent reject");
+                tracked_order.contingent_on_order_id = None;
+                tracked_order.order.clone()
+            };
+            let report = ExecutionReport::rejected(
+                self.allocate_execution_report_id(),
+                &order_snapshot,
+                rejected_at,
+                reason.to_owned(),
+            );
+            self.execution_reports.push(report);
+        }
     }
 
     /// Derives the current per-lot reservation plan of one live `SpecificLot`
@@ -1104,6 +1351,21 @@ mod tests {
             "AAPL",
             OrderSide::Sell,
             PositionEffect::Close,
+            ts(day),
+            dec(qty, 0),
+            dec(price, 0),
+            dec(0, 0),
+        )
+        .unwrap()
+    }
+
+    fn short_open_fill(order_id: u64, fill_id: u64, day: u32, qty: i64, price: i64) -> Fill {
+        Fill::new(
+            FillId::new(fill_id),
+            OrderId::new(order_id),
+            "AAPL",
+            OrderSide::Sell,
+            PositionEffect::Open,
             ts(day),
             dec(qty, 0),
             dec(price, 0),
@@ -1392,6 +1654,97 @@ mod tests {
                     None,
                 ))
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn allow_reversal_stages_open_order_until_auto_close_fills() {
+        let mut system = OrderSystem::new(LotReliefMethod::Fifo);
+        submit_and_fill_long(&mut system, 24, 2, 100);
+
+        let reversal = system
+            .submit_order(
+                SubmitOrderRequest::new(
+                    "AAPL",
+                    OrderSide::Sell,
+                    PositionEffect::Open,
+                    OrderType::Market,
+                    TimeInForce::Day,
+                    ts(26),
+                    dec(1, 0),
+                    None,
+                    None,
+                )
+                .with_allow_reversal(true),
+            )
+            .unwrap();
+
+        let auto_close = reversal
+            .auto_close_order
+            .as_ref()
+            .expect("reversal must create an auto-close order");
+        assert_eq!(auto_close.order.position_effect(), PositionEffect::Close);
+        assert_eq!(auto_close.order.requested_qty(), dec(2, 0));
+        assert_eq!(reversal.order.position_effect(), PositionEffect::Open);
+        assert_eq!(reversal.order.requested_qty(), dec(1, 0));
+
+        let early_fill_err = system
+            .apply_fill(short_open_fill(reversal.order.id().value(), 200, 27, 1, 99))
+            .unwrap_err();
+        assert_eq!(
+            early_fill_err,
+            OrderSystemError::OrderNotActive {
+                order_id: reversal.order.id(),
+                waiting_on_order_id: auto_close.order.id(),
+            }
+        );
+
+        system
+            .apply_fill(close_fill(auto_close.order.id().value(), 201, 27, 2, 99))
+            .unwrap();
+        system
+            .apply_fill(short_open_fill(reversal.order.id().value(), 202, 28, 1, 98))
+            .unwrap();
+
+        assert_eq!(system.holding("AAPL").unwrap().side(), Some(LotSide::Short));
+        assert_eq!(system.holding("AAPL").unwrap().open_qty(), dec(1, 0));
+    }
+
+    #[test]
+    fn canceling_auto_close_cascades_to_contingent_open_order() {
+        let mut system = OrderSystem::new(LotReliefMethod::Fifo);
+        submit_and_fill_long(&mut system, 24, 2, 100);
+
+        let reversal = system
+            .submit_order(
+                SubmitOrderRequest::new(
+                    "AAPL",
+                    OrderSide::Sell,
+                    PositionEffect::Open,
+                    OrderType::Market,
+                    TimeInForce::Day,
+                    ts(26),
+                    dec(1, 0),
+                    None,
+                    None,
+                )
+                .with_allow_reversal(true),
+            )
+            .unwrap();
+
+        let auto_close = reversal
+            .auto_close_order
+            .as_ref()
+            .expect("reversal must create an auto-close order");
+        system.cancel_order(auto_close.order.id(), ts(27)).unwrap();
+
+        assert_eq!(
+            system.order(auto_close.order.id()).unwrap().status(),
+            OrderStatus::Canceled
+        );
+        assert_eq!(
+            system.order(reversal.order.id()).unwrap().status(),
+            OrderStatus::Canceled
         );
     }
 

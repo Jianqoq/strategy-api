@@ -256,9 +256,10 @@ impl Strategy {
         side: Side,
         order_kind: OrderKind,
         qty: f64,
+        allow_reversal: bool,
     ) -> Result<SubmittedOrder, StrategyError> {
         let symbol = self.require_default_symbol()?.to_owned();
-        self.submit_order_for(symbol, side, order_kind, qty)
+        self.submit_order_for(symbol, side, order_kind, qty, allow_reversal)
     }
 
     /// Submits an opening order for an explicit symbol at the current bar time.
@@ -268,23 +269,27 @@ impl Strategy {
         side: Side,
         order_kind: OrderKind,
         qty: f64,
+        allow_reversal: bool,
     ) -> Result<SubmittedOrder, StrategyError> {
         let submitted_at = self.require_current_bar_time()?;
         let (order_type, limit_price, stop_price) = order_kind.to_order_params()?;
         let qty = decimal_from_f64("qty", qty)?;
 
         self.order_system
-            .submit_order(SubmitOrderRequest::new(
-                symbol,
-                side.to_open_order_side(),
-                crate::order_sys::order::PositionEffect::Open,
-                order_type,
-                TimeInForce::Day,
-                submitted_at,
-                qty,
-                limit_price,
-                stop_price,
-            ))
+            .submit_order(
+                SubmitOrderRequest::new(
+                    symbol,
+                    side.to_open_order_side(),
+                    crate::order_sys::order::PositionEffect::Open,
+                    order_type,
+                    TimeInForce::Day,
+                    submitted_at,
+                    qty,
+                    limit_price,
+                    stop_price,
+                )
+                .with_allow_reversal(allow_reversal),
+            )
             .map_err(StrategyError::from)
     }
 
@@ -548,7 +553,7 @@ pub trait OnIndicator {
 ///         ctx.set_default_symbol("AAPL");
 ///
 ///         if bar.close > self.prev_close {
-///             let _ = ctx.submit_order(Side::Long, OrderKind::Market, 1.0);
+///             let _ = ctx.submit_order(Side::Long, OrderKind::Market, 1.0, false);
 ///             let _ = ctx.mark_buy(bar.close);
 ///         } else if bar.close < self.prev_close {
 ///             let _ = ctx.close(1.0, OrderKind::Market);
@@ -715,12 +720,13 @@ mod tests {
         ctx.begin_bar(&bar(24, 100.0), 7);
 
         let submission = ctx
-            .submit_order(Side::Long, OrderKind::Market, 1.0)
+            .submit_order(Side::Long, OrderKind::Market, 1.0, false)
             .unwrap();
 
         assert_eq!(submission.order.symbol(), "AAPL");
         assert_eq!(submission.order.side(), OrderSide::Buy);
         assert_eq!(submission.order.status(), OrderStatus::Pending);
+        assert!(submission.auto_close_order.is_none());
         assert_eq!(ctx.current_bar_index(), Some(7));
     }
 
@@ -731,7 +737,7 @@ mod tests {
         ctx.begin_bar(&bar(24, 100.0), 0);
 
         let open = ctx
-            .submit_order(Side::Long, OrderKind::Market, 2.0)
+            .submit_order(Side::Long, OrderKind::Market, 2.0, false)
             .unwrap();
         ctx.apply_fill(open_fill(open.order.id().value(), 10, 24, 2, 100))
             .unwrap();
@@ -743,6 +749,37 @@ mod tests {
         assert_eq!(close.order.position_effect(), PositionEffect::Close);
         assert_eq!(close.order.side(), OrderSide::Sell);
         assert_eq!(flatten.order.requested_qty(), Decimal::ONE);
+    }
+
+    #[test]
+    fn strategy_submit_order_can_request_auto_reversal() {
+        let mut ctx = Strategy::new(LotReliefMethod::Fifo);
+        ctx.set_default_symbol("AAPL");
+        ctx.begin_bar(&bar(24, 100.0), 0);
+
+        let open = ctx
+            .submit_order(Side::Long, OrderKind::Market, 2.0, false)
+            .unwrap();
+        ctx.apply_fill(open_fill(open.order.id().value(), 10, 24, 2, 100))
+            .unwrap();
+
+        ctx.begin_bar(&bar(25, 99.0), 1);
+        let reversal = ctx
+            .submit_order(Side::Short, OrderKind::Market, 1.0, true)
+            .unwrap();
+
+        assert_eq!(reversal.order.side(), OrderSide::Sell);
+        assert_eq!(reversal.order.position_effect(), PositionEffect::Open);
+        assert!(reversal.auto_close_order.is_some());
+        assert_eq!(
+            reversal
+                .auto_close_order
+                .as_ref()
+                .expect("reversal should stage an auto-close order")
+                .order
+                .position_effect(),
+            PositionEffect::Close
+        );
     }
 
     #[test]
@@ -762,13 +799,13 @@ mod tests {
         let mut ctx = Strategy::default();
 
         let err = ctx
-            .submit_order(Side::Long, OrderKind::Market, 1.0)
+            .submit_order(Side::Long, OrderKind::Market, 1.0, false)
             .unwrap_err();
         assert_eq!(err, StrategyError::MissingDefaultSymbol);
 
         ctx.set_default_symbol("AAPL");
         let err = ctx
-            .submit_order(Side::Long, OrderKind::Market, 1.0)
+            .submit_order(Side::Long, OrderKind::Market, 1.0, false)
             .unwrap_err();
         assert_eq!(err, StrategyError::MissingBarContext);
     }
