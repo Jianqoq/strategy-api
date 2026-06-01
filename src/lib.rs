@@ -6,6 +6,8 @@ pub const HOST_API_ERR_INVALID_SIDE: i32 = 1;
 pub const HOST_API_ERR_INVALID_QUANTITY: i32 = 2;
 pub const HOST_API_ERR_INVALID_PRICE: i32 = 3;
 pub const HOST_API_ERR_SUBMIT_FAILED: i32 = 4;
+pub const HOST_API_ERR_INVALID_SERIES: i32 = 5;
+pub const HOST_API_ERR_INVALID_INDEX: i32 = 6;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
@@ -94,6 +96,25 @@ impl StrategyContext {
         ))
     }
 
+    pub fn add_serie_point(
+        &self,
+        series: &str,
+        index: usize,
+        price: f32,
+        color: [u8; 4],
+    ) -> Result<(), HostError> {
+        self.submit_status(host_add_serie_point(
+            series.as_ptr() as i32,
+            series.len() as i32,
+            index as i32,
+            price,
+            color[0] as i32,
+            color[1] as i32,
+            color[2] as i32,
+            color[3] as i32,
+        ))
+    }
+
     fn submit_status(&self, status: i32) -> Result<(), HostError> {
         match status {
             HOST_API_OK => Ok(()),
@@ -101,6 +122,8 @@ impl StrategyContext {
             HOST_API_ERR_INVALID_QUANTITY => Err(HostError::InvalidQuantity),
             HOST_API_ERR_INVALID_PRICE => Err(HostError::InvalidPrice),
             HOST_API_ERR_SUBMIT_FAILED => Err(HostError::SubmitFailed),
+            HOST_API_ERR_INVALID_SERIES => Err(HostError::InvalidSeries),
+            HOST_API_ERR_INVALID_INDEX => Err(HostError::InvalidIndex),
             code => Err(HostError::Unknown(code)),
         }
     }
@@ -112,6 +135,8 @@ pub enum HostError {
     InvalidQuantity,
     InvalidPrice,
     SubmitFailed,
+    InvalidSeries,
+    InvalidIndex,
     Unknown(i32),
 }
 
@@ -147,6 +172,17 @@ unsafe extern "C" {
         stop_price: f64,
         reduce_only: i32,
     ) -> i32;
+    #[link_name = "add_serie_point"]
+    fn raw_host_add_serie_point(
+        series_ptr: i32,
+        series_len: i32,
+        index: i32,
+        price: f32,
+        r: i32,
+        g: i32,
+        b: i32,
+        a: i32,
+    ) -> i32;
 }
 
 #[cfg(not(test))]
@@ -180,6 +216,20 @@ fn host_submit_stop_limit_order(
     unsafe {
         raw_host_submit_stop_limit_order(side, quantity, limit_price, stop_price, reduce_only)
     }
+}
+
+#[cfg(not(test))]
+fn host_add_serie_point(
+    series_ptr: i32,
+    series_len: i32,
+    index: i32,
+    price: f32,
+    r: i32,
+    g: i32,
+    b: i32,
+    a: i32,
+) -> i32 {
+    unsafe { raw_host_add_serie_point(series_ptr, series_len, index, price, r, g, b, a) }
 }
 
 #[macro_export]
@@ -284,6 +334,20 @@ fn host_submit_stop_limit_order(
     _limit_price: f64,
     _stop_price: f64,
     _reduce_only: i32,
+) -> i32 {
+    HOST_API_OK
+}
+
+#[cfg(test)]
+fn host_add_serie_point(
+    _series_ptr: i32,
+    _series_len: i32,
+    _index: i32,
+    _price: f32,
+    _r: i32,
+    _g: i32,
+    _b: i32,
+    _a: i32,
 ) -> i32 {
     HOST_API_OK
 }
